@@ -1,0 +1,4 @@
+# Store text files with LF line endings and keep LF in the working copy on every OS,
+# overriding core.autocrlf so Windows and other systems see identical files.
+* text=auto eol=lf
+*.java text eol=lf

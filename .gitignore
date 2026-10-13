@@ -1,0 +1,19 @@
+# Compiled output (rebuilt by javac)
+out/
+out-test/
+*.class
+
+# Editor and IDE settings
+.idea/
+.vscode/
+
+# Operating system files
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Logs
+*.log
+
+# Demo workspaces, in case one is ever created inside the project
+distributedfs-demo-*/
