@@ -2,12 +2,9 @@ package com.distributedfs;
 
 import java.io.IOException;
 import java.io.PrintStream;
-import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
-import java.nio.file.SimpleFileVisitor;
-import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -228,41 +225,9 @@ public class DistributedFsDemo {
         out.println("  reconstructed\\   the rebuilt file");
     }
 
-    /**
-     * Deletes the workspace, deepest entries first, without ever following a link out of it.
-     *
-     * <p>Files.walkFileTree does not follow symbolic links: a link arrives at visitFile, and
-     * deleting it removes only the link. A Windows junction is different: Java reports it as a
-     * directory (and as "other", because it is a reparse point), so a plain walk would go inside
-     * it and delete files that live outside the workspace. preVisitDirectory therefore deletes
-     * such an entry as a link and skips everything behind it.
-     */
+    /** Deletes the workspace without ever following a link out of it (see {@link FileTrees#deleteTree}). */
     static void deleteWorkspace(Path workspace) throws IOException {
-        Files.walkFileTree(workspace, new SimpleFileVisitor<>() {
-            @Override
-            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attributes) throws IOException {
-                if (!dir.equals(workspace) && attributes.isOther()) {
-                    Files.delete(dir); // removes the junction itself, never its target
-                    return FileVisitResult.SKIP_SUBTREE;
-                }
-                return FileVisitResult.CONTINUE;
-            }
-
-            @Override
-            public FileVisitResult visitFile(Path file, BasicFileAttributes attributes) throws IOException {
-                Files.delete(file);
-                return FileVisitResult.CONTINUE;
-            }
-
-            @Override
-            public FileVisitResult postVisitDirectory(Path dir, IOException error) throws IOException {
-                if (error != null) {
-                    throw error;
-                }
-                Files.delete(dir);
-                return FileVisitResult.CONTINUE;
-            }
-        });
+        FileTrees.deleteTree(workspace);
     }
 
     private static void reportError(PrintStream err, Exception e) {

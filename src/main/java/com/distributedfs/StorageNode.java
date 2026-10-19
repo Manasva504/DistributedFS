@@ -3,14 +3,21 @@ package com.distributedfs;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.file.DirectoryStream;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Consumer;
+import java.util.regex.Pattern;
 
 /**
  * A simulated storage node. It keeps chunks as files in its own local directory and hands out
@@ -38,6 +45,12 @@ import java.util.Set;
  * example, its storage directory was deleted after the node started), they throw a plain
  * {@link IOException}. A broken node is never reported as one that simply lacks the chunk.
  *
+ * <p><b>Deleting.</b> {@link #deleteChunk(String)} is stricter than the other methods: it reads
+ * attributes without following links, and deletes a chunk only if the storage directory is a
+ * plain directory (not a symbolic link or junction) and the chunk's entry is a regular file. If
+ * either cannot be established, nothing is deleted and an IOException is thrown. Temp files and
+ * other chunks are never touched.
+ *
  * <p><b>Assumptions and limits.</b>
  * <ul>
  *   <li>Single-threaded use: only one thread, through one StorageNode object, should write to a
@@ -47,7 +60,8 @@ import java.util.Set;
  *   <li>Data is not forced to disk (no fsync), so a power cut right after a store can still
  *       lose the chunk.</li>
  *   <li>If the process is killed during a store, an orphaned {@code .tmp} file may remain.
- *       It is never treated as a chunk, but nothing cleans it up yet.</li>
+ *       It is never treated as a chunk. The server's startup recovery removes such files
+ *       ({@link #sweepStaleTempFiles}); a node used on its own does not.</li>
  * </ul>
  */
 public class StorageNode {
@@ -56,6 +70,16 @@ public class StorageNode {
     private static final int BUFFER_SIZE = 64 * 1024;
 
     private static final int MAX_CHUNK_ID_LENGTH = 128;
+
+    /** A name made only of chunk-ID characters: a chunk, never a temp file (which has a dot). */
+    private static final Pattern CHUNK_NAME = Pattern.compile("[a-z0-9_-]{1," + MAX_CHUNK_ID_LENGTH + "}");
+
+    /**
+     * Exactly the names {@code Files.createTempFile(storageDir, chunkId + "-", ".tmp")} produces:
+     * the JDK inserts {@code Long.toUnsignedString} of a random number, so 1 to 20 digits.
+     */
+    private static final Pattern TEMP_NAME =
+            Pattern.compile("[a-z0-9_-]{1," + MAX_CHUNK_ID_LENGTH + "}-[0-9]{1,20}\\.tmp");
 
     /**
      * Names Windows reserves for devices, in any letter case and even inside a folder. A "file"
@@ -203,6 +227,112 @@ public class StorageNode {
     }
 
     /**
+     * Deletes the chunk {@code chunkId} from this node.
+     *
+     * <p>Unlike {@link #hasChunk}, every check here reads attributes without following links: the
+     * storage directory must be a plain directory, not a symbolic link or junction, and the
+     * chunk's entry must be a regular file. If either cannot be established, nothing is deleted.
+     *
+     * @return {@code true} if this call deleted the chunk; {@code false} only if the storage
+     *         directory is available and has no entry with this ID. That includes a chunk that
+     *         disappeared between the check and the delete, which is confirmed by checking again.
+     * @throws NullPointerException if {@code chunkId} is null
+     * @throws IllegalArgumentException if the chunk ID is invalid (checked before any disk access)
+     * @throws IOException if the storage directory is missing or is not a plain directory, if the
+     *         entry under this ID is not a regular file (it is left in place), or if deleting fails
+     */
+    public boolean deleteChunk(String chunkId) throws IOException {
+        Path chunkFile = chunkFileFor(chunkId);
+        if (!regularChunkFileExists(chunkFile)) {
+            return false;
+        }
+        try {
+            deleteChunkFile(chunkFile);
+        } catch (NoSuchFileException e) {
+            // The chunk vanished between the check and the delete. Check again before calling it
+            // absent: the storage directory itself may have gone, or something may be there again.
+            boolean stillPresent;
+            try {
+                stillPresent = regularChunkFileExists(chunkFile);
+            } catch (IOException recheckError) {
+                recheckError.addSuppressed(e);
+                throw recheckError;
+            }
+            if (stillPresent) {
+                throw new IOException("Chunk \"" + chunkId + "\" was reported missing by the delete but is still"
+                        + " present: " + chunkFile, e);
+            }
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Reports whether this node holds the chunk as a genuine regular file, using the same
+     * no-follow checks as {@link #deleteChunk}: {@code true} for a regular file, {@code false} only
+     * if the storage directory is a plain directory with no entry under this ID, and an
+     * IOException in every other case (a missing or linked storage directory, or an entry that is
+     * a directory, symbolic link, junction or other reparse point).
+     *
+     * <p>Package-private: StorageCluster.deleteChunk uses it, rather than {@link #hasChunk} (which
+     * follows links), to decide which node holds a chunk before deleting anything.
+     *
+     * @throws NullPointerException if {@code chunkId} is null
+     * @throws IllegalArgumentException if the chunk ID is invalid (checked before any disk access)
+     */
+    boolean holdsRegularChunkFile(String chunkId) throws IOException {
+        return regularChunkFileExists(chunkFileFor(chunkId));
+    }
+
+    /**
+     * Deletes one chunk file. Used only by {@link #deleteChunk}.
+     *
+     * <p>Why this method exists: it is a small testability hook, like {@link #openForReading}.
+     * StorageNodeTest and StorageClusterTest (same package) override it to make a delete fail, or
+     * to make the file disappear just before the delete, which a real disk cannot be made to do on
+     * demand. It is package-private, so it is not part of the public API.
+     */
+    void deleteChunkFile(Path chunkFile) throws IOException {
+        Files.delete(chunkFile);
+    }
+
+    /**
+     * The names of every entry in the storage directory, sorted, whatever they are: chunks, temp
+     * files and anything else. The directory must be a plain directory (not a link or junction).
+     *
+     * <p>Package-private: startup recovery uses it to see which chunks exist.
+     *
+     * @throws IOException if the storage directory is missing, is not a plain directory, or
+     *         cannot be listed
+     */
+    List<String> listEntryNames() throws IOException {
+        requirePlainStorageDirectory();
+        List<String> names = new ArrayList<>();
+        try (DirectoryStream<Path> entries = Files.newDirectoryStream(storageDir)) {
+            for (Path entry : entries) {
+                names.add(entry.getFileName().toString());
+            }
+        }
+        Collections.sort(names);
+        return names;
+    }
+
+    /**
+     * Deletes temp files that a killed store left behind ({@code <chunkId>-<digits>.tmp}), with
+     * the rules of {@link StaleTempFiles#sweep}: regular files only, never following a link, and
+     * never touching a chunk. Returns how many were deleted.
+     *
+     * <p>Package-private: only startup recovery calls it, while no store can be running.
+     *
+     * @throws IOException if the storage directory is not a plain directory or cannot be listed
+     */
+    int sweepStaleTempFiles(Consumer<String> warnings) throws IOException {
+        requirePlainStorageDirectory();
+        return StaleTempFiles.sweep(storageDir, "the storage folder of node " + storageDir, TEMP_NAME,
+                name -> CHUNK_NAME.matcher(name).matches(), warnings);
+    }
+
+    /**
      * Opens a file for reading: the source file in {@link #storeChunk}, the chunk file in
      * {@link #retrieveChunk}.
      *
@@ -327,6 +457,44 @@ public class StorageNode {
         if (!Files.isDirectory(storageDir)) {
             throw new IOException("Storage directory is not available (deleted, moved, or replaced since"
                     + " the node started): " + storageDir);
+        }
+    }
+
+    /**
+     * The no-follow check used for deleting. Returns true if the entry is a regular file, and
+     * false only if the storage directory is a plain directory with no entry under this name.
+     * Throws if the storage directory is missing or is not a plain directory, if the entry is
+     * anything other than a regular file (a directory, symbolic link, junction or other reparse
+     * point: Java reports all of these as not regular when links are not followed), or if the
+     * attributes cannot be read.
+     */
+    private boolean regularChunkFileExists(Path chunkFile) throws IOException {
+        requirePlainStorageDirectory();
+        BasicFileAttributes attributes;
+        try {
+            attributes = Files.readAttributes(chunkFile, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        } catch (NoSuchFileException e) {
+            // Nothing under this name means "absent" only while the storage directory is still there.
+            requirePlainStorageDirectory();
+            return false;
+        }
+        if (!attributes.isRegularFile()) {
+            throw new IOException("Storage entry for this chunk is not a regular file (it may be a directory,"
+                    + " a link or a junction); nothing was deleted: " + chunkFile);
+        }
+        return true;
+    }
+
+    /**
+     * Requires the storage directory to be a plain directory, read without following links: not
+     * missing, not a file, not a symbolic link, and not a junction or other reparse point. Uses
+     * the same check as DataDirectory, which Java's attributes support as "directory, and neither
+     * a symbolic link nor other".
+     */
+    private void requirePlainStorageDirectory() throws IOException {
+        if (!DataDirectory.isPlainDirectory(storageDir)) {
+            throw new IOException("Storage directory is missing or is not a plain directory (it may have been"
+                    + " deleted, or replaced by a file, link or junction); nothing was deleted: " + storageDir);
         }
     }
 

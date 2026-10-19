@@ -4,14 +4,20 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.Random;
 import java.util.stream.Stream;
@@ -40,6 +46,7 @@ public class StorageNodeTest {
 
     private static int passed = 0;
     private static int failed = 0;
+    private static int skipped = 0;
 
     public static void main(String[] args) {
         boolean stressMode = args.length == 1 && args[0].equals("--stress");
@@ -56,7 +63,7 @@ public class StorageNodeTest {
         }
 
         System.out.println();
-        System.out.println(passed + " passed, " + failed + " failed");
+        System.out.println(passed + " passed, " + failed + " failed" + (skipped > 0 ? ", " + skipped + " skipped" : ""));
         if (failed > 0) {
             System.exit(1);
         }
@@ -120,6 +127,86 @@ public class StorageNodeTest {
         runTest("a directory in place of a chunk is an error, not a missing chunk",
                 StorageNodeTest::unexpectedDirectoryIsAnError);
         runTest("an orphaned temp file is never treated as a chunk", StorageNodeTest::orphanedTempFileIsIgnored);
+
+        // Deleting
+        runTest("deleteChunk removes a stored chunk and returns true", StorageNodeTest::deleteRemovesChunk);
+        runTest("deleteChunk returns false for a missing chunk and changes nothing",
+                StorageNodeTest::deleteMissingChunkReturnsFalse);
+        runTest("deleteChunk leaves other chunks and temp files untouched", StorageNodeTest::deleteLeavesOtherEntriesAlone);
+        runTest("deleteChunk rejects invalid IDs before touching anything", StorageNodeTest::deleteRejectsInvalidIds);
+        runTest("deleteChunk with a deleted storage directory is an error, not a missing chunk",
+                StorageNodeTest::deleteWithMissingStorageDirIsAnError);
+        runTest("deleteChunk with a file in place of the storage directory is an error",
+                StorageNodeTest::deleteWithStorageDirReplacedByFileIsAnError);
+        runTest("deleteChunk with a junction in place of the storage directory is an error and changes nothing",
+                StorageNodeTest::deleteWithStorageDirReplacedByJunctionIsAnError);
+        runTest("deleteChunk refuses a directory under the chunk's ID and leaves it in place",
+                StorageNodeTest::deleteRefusesDirectoryEntry);
+        runTest("deleteChunk refuses a junction under the chunk's ID and leaves it and its target untouched",
+                StorageNodeTest::deleteRefusesJunctionEntry);
+        runTest("a failing delete is reported and the chunk stays", StorageNodeTest::injectedDeleteFailurePropagates);
+        runTest("a chunk that vanishes just before the delete is reported as absent after a recheck",
+                StorageNodeTest::raceChunkVanishedReturnsFalse);
+        runTest("a delete that reports 'missing' while the chunk is still there is an error",
+                StorageNodeTest::raceInconsistentStateIsAnError);
+        runTest("a storage directory that vanishes during the delete is an error, not a missing chunk",
+                StorageNodeTest::raceStorageDirVanishedIsAnError);
+        runTest("holdsRegularChunkFile answers true, false or IOException without following links",
+                StorageNodeTest::holdsRegularChunkFileAnswers);
+        runTest("a deleted ID can be stored again, and a new node object can delete existing chunks",
+                StorageNodeTest::deletedIdCanBeReused);
+        runTest("deleteChunk refuses a symbolic link to a regular file and leaves the link and its target untouched",
+                StorageNodeTest::deleteRefusesFileSymlinkEntry);
+
+        // Listing and stale temp files (used by startup recovery)
+        runTest("listEntryNames lists every entry, sorted, and refuses a missing or junctioned storage directory",
+                StorageNodeTest::listEntryNamesListsEverything);
+        runTest("sweepStaleTempFiles deletes only regular temp files and never a chunk or a junction",
+                StorageNodeTest::sweepDeletesOnlyStaleTempFiles);
+    }
+
+    private static void listEntryNamesListsEverything(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir);
+        node.storeChunk("chunk_10", Files.write(tempDir.resolve("source.bin"), randomBytes(10, 1)));
+        node.storeChunk("chunk_2", tempDir.resolve("source.bin"));
+        Files.writeString(nodeDir.resolve("chunk_2-55.tmp"), "partial");
+        Files.createDirectory(nodeDir.resolve("folder"));
+
+        checkEquals(List.of("chunk_10", "chunk_2", "chunk_2-55.tmp", "folder"), node.listEntryNames(), "names");
+
+        Path target = Files.createDirectory(tempDir.resolve("target"));
+        Path junctionDir = tempDir.resolve("junctioned");
+        StorageNode junctioned = new StorageNode(junctionDir);
+        Files.delete(junctionDir);
+        createDirectoryJunction(junctionDir, target);
+        expectThrows(IOException.class, "a junction as the storage directory", junctioned::listEntryNames);
+
+        deleteRecursively(nodeDir);
+        expectThrows(IOException.class, "a deleted storage directory", node::listEntryNames);
+    }
+
+    private static void sweepDeletesOnlyStaleTempFiles(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir);
+        byte[] data = randomBytes(100, 1);
+        node.storeChunk("chunk_1", Files.write(tempDir.resolve("source.bin"), data));
+        Files.writeString(nodeDir.resolve("chunk_1-5.tmp"), "partial");
+        Files.writeString(nodeDir.resolve("chunk_1-18446744073709551615.tmp"), "partial");
+        Files.writeString(nodeDir.resolve("chunk_1-123456789012345678901.tmp"), "21 digits");
+        Files.writeString(nodeDir.resolve("notes.txt"), "notes");
+        Path target = Files.createDirectory(tempDir.resolve("target"));
+        Files.writeString(target.resolve("precious.txt"), "precious");
+        createDirectoryJunction(nodeDir.resolve("chunk_2-6.tmp"), target);
+
+        List<String> warnings = new ArrayList<>();
+        checkEquals(2, node.sweepStaleTempFiles(warnings::add), "deleted temp files");
+
+        checkEquals(List.of("chunk_1", "chunk_1-123456789012345678901.tmp", "chunk_2-6.tmp", "notes.txt"),
+                listNames(nodeDir), "remaining entries");
+        checkBytes(data, nodeDir.resolve("chunk_1"));
+        checkEquals("precious", Files.readString(target.resolve("precious.txt")), "the junction's target");
+        checkEquals(3, warnings.size(), "one warning per entry left in place (not the chunk): " + warnings);
     }
 
     private static void runStressTest() {
@@ -451,6 +538,286 @@ public class StorageNodeTest {
 
     /** The content of chunk_0 in the destination tests, used to check that it never changes. */
     private static final byte[] DESTINATION_TEST_DATA = "the stored chunk".getBytes(StandardCharsets.UTF_8);
+
+    // ---------------------------------------------------------------------
+    // Deleting
+    // ---------------------------------------------------------------------
+
+    private static void deleteRemovesChunk(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir);
+        node.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), randomBytes(100, 1)));
+
+        check(node.deleteChunk("chunk_0"), "deleting a stored chunk should return true");
+
+        check(!node.hasChunk("chunk_0"), "the chunk should be gone");
+        expectThrows(ChunkNotFoundException.class, () -> node.retrieveChunk("chunk_0", tempDir.resolve("retrieved.bin")));
+        checkEquals(List.of(), listNames(nodeDir), "files in the node directory");
+    }
+
+    private static void deleteMissingChunkReturnsFalse(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir);
+        byte[] data = randomBytes(100, 1);
+        node.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), data));
+
+        check(!node.deleteChunk("chunk_9"), "deleting a chunk that was never stored should return false");
+        checkEquals(List.of("chunk_0"), listNames(nodeDir), "files in the node directory");
+        checkBytes(data, nodeDir.resolve("chunk_0"));
+
+        check(node.deleteChunk("chunk_0"), "first delete of chunk_0");
+        check(!node.deleteChunk("chunk_0"), "a second delete of the same chunk should return false");
+        checkEquals(List.of(), listNames(nodeDir), "files after both deletes");
+    }
+
+    private static void deleteLeavesOtherEntriesAlone(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir);
+        byte[] data1 = randomBytes(100, 1);
+        byte[] data10 = randomBytes(200, 10);
+        byte[] dataDash = randomBytes(50, 2);
+        node.storeChunk("chunk_1", Files.write(tempDir.resolve("source1.bin"), data1));
+        node.storeChunk("chunk_10", Files.write(tempDir.resolve("source10.bin"), data10));
+        node.storeChunk("chunk_1-a", Files.write(tempDir.resolve("sourceDash.bin"), dataDash));
+        // An orphaned temp file of chunk_1, as a killed store would leave it.
+        byte[] tempData = "orphaned temp file".getBytes(StandardCharsets.UTF_8);
+        Files.write(nodeDir.resolve("chunk_1-123.tmp"), tempData);
+
+        check(node.deleteChunk("chunk_1"), "delete chunk_1");
+
+        checkEquals(Stream.of("chunk_1-123.tmp", "chunk_10", "chunk_1-a").sorted().toList(), listNames(nodeDir),
+                "files left in the node directory");
+        checkBytes(data10, nodeDir.resolve("chunk_10"));
+        checkBytes(dataDash, nodeDir.resolve("chunk_1-a"));
+        checkBytes(tempData, nodeDir.resolve("chunk_1-123.tmp"));
+    }
+
+    private static void deleteRejectsInvalidIds(Path tempDir) throws IOException {
+        Path secret = Files.write(tempDir.resolve("secret.txt"), "secret data".getBytes(StandardCharsets.UTF_8));
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir);
+        byte[] data = randomBytes(10, 1);
+        node.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), data));
+        List<String> before = listTree(tempDir);
+
+        expectThrows(NullPointerException.class, () -> node.deleteChunk(null));
+        String[] invalidIds = {
+            "", "a".repeat(129), "Chunk_0", "CHUNK_0", "chunk_0.tmp", "a b", "con", "nul",
+            "../secret.txt", "..\\secret.txt", "..", secret.toAbsolutePath().toString(), "C:secret.txt",
+        };
+        for (String id : invalidIds) {
+            expectThrows(IllegalArgumentException.class, "deleteChunk(" + show(id) + ")", () -> node.deleteChunk(id));
+        }
+
+        checkEquals(before, listTree(tempDir), "everything in the test folder");
+        checkBytes(data, nodeDir.resolve("chunk_0"));
+        checkBytes("secret data".getBytes(StandardCharsets.UTF_8), secret);
+    }
+
+    private static void deleteWithMissingStorageDirIsAnError(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir);
+        node.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), randomBytes(10, 1)));
+        deleteRecursively(nodeDir);
+
+        IOException e = expectThrows(IOException.class, "a chunk that was stored", () -> node.deleteChunk("chunk_0"));
+        checkContains(e.getMessage(), "not a plain directory");
+        expectThrows(IOException.class, "a chunk that was never stored", () -> node.deleteChunk("chunk_9"));
+        check(!Files.exists(nodeDir), "the node must not recreate its storage directory");
+    }
+
+    private static void deleteWithStorageDirReplacedByFileIsAnError(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir);
+        node.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), randomBytes(10, 1)));
+        deleteRecursively(nodeDir);
+        Files.writeString(nodeDir, "a file where the storage directory was");
+
+        IOException e = expectThrows(IOException.class, () -> node.deleteChunk("chunk_0"));
+        checkContains(e.getMessage(), "not a plain directory");
+        checkEquals("a file where the storage directory was", Files.readString(nodeDir), "the file is unchanged");
+    }
+
+    private static void deleteWithStorageDirReplacedByJunctionIsAnError(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir);
+        // Behind the junction: a regular file with the chunk's name, which must not be deleted.
+        Path outside = Files.createDirectory(tempDir.resolve("outside"));
+        byte[] outsideData = randomBytes(64, 7);
+        Files.write(outside.resolve("chunk_0"), outsideData);
+        Files.delete(nodeDir);
+        createDirectoryJunction(nodeDir, outside);
+        try {
+            IOException e = expectThrows(IOException.class, "an ID with a file behind the junction",
+                    () -> node.deleteChunk("chunk_0"));
+            checkContains(e.getMessage(), "not a plain directory");
+            expectThrows(IOException.class, "an ID with nothing behind the junction", () -> node.deleteChunk("chunk_9"));
+
+            check(Files.exists(nodeDir, LinkOption.NOFOLLOW_LINKS), "the junction is left in place");
+            checkEquals(List.of("chunk_0"), listNames(outside), "files behind the junction");
+            checkBytes(outsideData, outside.resolve("chunk_0"));
+        } finally {
+            Files.deleteIfExists(nodeDir); // removes the junction itself, never its target
+        }
+    }
+
+    private static void deleteRefusesDirectoryEntry(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir);
+        Path entry = Files.createDirectory(nodeDir.resolve("chunk_0"));
+        Files.writeString(entry.resolve("inside.txt"), "inside");
+
+        IOException e = expectThrows(IOException.class, () -> node.deleteChunk("chunk_0"));
+        checkContains(e.getMessage(), "not a regular file");
+        check(Files.isDirectory(entry), "the directory is left in place");
+        checkEquals("inside", Files.readString(entry.resolve("inside.txt")), "the file inside the directory");
+    }
+
+    private static void deleteRefusesJunctionEntry(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir);
+        Path outside = Files.createDirectory(tempDir.resolve("outside"));
+        byte[] outsideData = randomBytes(64, 7);
+        Files.write(outside.resolve("precious.bin"), outsideData);
+        Path entry = nodeDir.resolve("chunk_0");
+        createDirectoryJunction(entry, outside);
+        try {
+            IOException e = expectThrows(IOException.class, () -> node.deleteChunk("chunk_0"));
+            checkContains(e.getMessage(), "not a regular file");
+            check(Files.exists(entry, LinkOption.NOFOLLOW_LINKS), "the junction is left in place");
+            checkEquals(List.of("precious.bin"), listNames(outside), "files behind the junction");
+            checkBytes(outsideData, outside.resolve("precious.bin"));
+        } finally {
+            Files.deleteIfExists(entry); // removes the junction itself, never its target
+        }
+    }
+
+    private static void injectedDeleteFailurePropagates(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        AccessDeniedException failure = new AccessDeniedException("chunk_0", null, "simulated: the file is in use");
+        StorageNode node = new StorageNode(nodeDir) {
+            @Override
+            void deleteChunkFile(Path chunkFile) throws IOException {
+                throw failure;
+            }
+        };
+        byte[] data = randomBytes(100, 1);
+        node.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), data));
+
+        AccessDeniedException e = expectThrows(AccessDeniedException.class, () -> node.deleteChunk("chunk_0"));
+
+        check(e == failure, "the node's own error should be passed through unchanged");
+        check(node.hasChunk("chunk_0"), "the chunk should still be there");
+        checkBytes(data, nodeDir.resolve("chunk_0"));
+    }
+
+    private static void raceChunkVanishedReturnsFalse(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir) {
+            @Override
+            void deleteChunkFile(Path chunkFile) throws IOException {
+                Files.delete(chunkFile); // something else removes the chunk first...
+                throw new NoSuchFileException(chunkFile.toString()); // ...so this delete finds nothing
+            }
+        };
+        node.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), randomBytes(10, 1)));
+
+        check(!node.deleteChunk("chunk_0"), "a chunk that was already gone should be reported as absent");
+        checkEquals(List.of(), listNames(nodeDir), "files in the node directory");
+    }
+
+    private static void raceInconsistentStateIsAnError(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir) {
+            @Override
+            void deleteChunkFile(Path chunkFile) throws IOException {
+                throw new NoSuchFileException(chunkFile.toString()); // says "missing" but deletes nothing
+            }
+        };
+        byte[] data = randomBytes(10, 1);
+        node.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), data));
+
+        IOException e = expectThrows(IOException.class, () -> node.deleteChunk("chunk_0"));
+
+        check(!(e instanceof NoSuchFileException), "the recheck should turn this into a plain IOException");
+        checkContains(e.getMessage(), "still present");
+        check(e.getCause() instanceof NoSuchFileException, "the delete's own error should be kept as the cause");
+        checkBytes(data, nodeDir.resolve("chunk_0"));
+    }
+
+    private static void raceStorageDirVanishedIsAnError(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir) {
+            @Override
+            void deleteChunkFile(Path chunkFile) throws IOException {
+                deleteRecursively(nodeDir); // the whole storage directory disappears...
+                throw new NoSuchFileException(chunkFile.toString()); // ...as the delete runs
+            }
+        };
+        node.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), randomBytes(10, 1)));
+
+        IOException e = expectThrows(IOException.class, () -> node.deleteChunk("chunk_0"));
+
+        checkContains(e.getMessage(), "not a plain directory");
+        checkEquals(1, e.getSuppressed().length, "number of attached errors");
+        check(e.getSuppressed()[0] instanceof NoSuchFileException, "the delete's own error should be attached");
+    }
+
+    private static void holdsRegularChunkFileAnswers(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir);
+        node.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), randomBytes(10, 1)));
+        Files.createDirectory(nodeDir.resolve("chunk_1"));
+
+        check(node.holdsRegularChunkFile("chunk_0"), "a stored chunk is a regular file");
+        check(!node.holdsRegularChunkFile("chunk_9"), "a chunk never stored is absent");
+        expectThrows(IOException.class, "a directory under the ID", () -> node.holdsRegularChunkFile("chunk_1"));
+        expectThrows(IllegalArgumentException.class, "an invalid ID", () -> node.holdsRegularChunkFile("../x"));
+        expectThrows(NullPointerException.class, "null", () -> node.holdsRegularChunkFile(null));
+        checkEquals(List.of("chunk_0", "chunk_1"), listNames(nodeDir), "nothing was changed by asking");
+    }
+
+    private static void deletedIdCanBeReused(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode first = new StorageNode(nodeDir);
+        byte[] oldData = randomBytes(100, 1);
+        byte[] otherData = randomBytes(100, 2);
+        byte[] newData = randomBytes(150, 3);
+        first.storeChunk("chunk_0", Files.write(tempDir.resolve("old.bin"), oldData));
+        first.storeChunk("chunk_1", Files.write(tempDir.resolve("other.bin"), otherData));
+
+        // A new node object over the same folder (a simulated restart) deletes what the first stored.
+        StorageNode restarted = new StorageNode(nodeDir);
+        check(restarted.deleteChunk("chunk_0"), "the restarted node deletes chunk_0");
+        restarted.storeChunk("chunk_0", Files.write(tempDir.resolve("new.bin"), newData));
+
+        Path retrieved = tempDir.resolve("retrieved.bin");
+        restarted.retrieveChunk("chunk_0", retrieved);
+        checkBytes(newData, retrieved);
+        checkBytes(otherData, nodeDir.resolve("chunk_1"));
+    }
+
+    /**
+     * The case only a symbolic link to a file can show: hasChunk (which follows links) sees a
+     * regular file here, so deleteChunk must find out with its own no-follow check. Skipped, not
+     * passed, where this account may not create symbolic links.
+     */
+    private static void deleteRefusesFileSymlinkEntry(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir);
+        byte[] targetData = randomBytes(64, 7);
+        Path target = Files.write(tempDir.resolve("target.bin"), targetData);
+        Path link = nodeDir.resolve("chunk_0");
+        createFileSymlinkOrSkip(link, target);
+
+        IOException e = expectThrows(IOException.class, "deleteChunk", () -> node.deleteChunk("chunk_0"));
+        checkContains(e.getMessage(), "not a regular file");
+        expectThrows(IOException.class, "holdsRegularChunkFile", () -> node.holdsRegularChunkFile("chunk_0"));
+
+        check(Files.isSymbolicLink(link), "the link is left in place");
+        checkEquals(target, Files.readSymbolicLink(link), "the link still points at its target");
+        checkBytes(targetData, target);
+    }
 
     /** Creates a node in tempDir/node holding one chunk, chunk_0, for the destination tests. */
     private static StorageNode nodeWithOneChunk(Path tempDir) throws IOException {
@@ -955,6 +1322,10 @@ public class StorageNodeTest {
             body.run(tempDir);
             passed++;
             System.out.println("PASS  " + name);
+        } catch (SkipTest e) {
+            skipped++;
+            System.out.println("SKIP  " + name);
+            System.out.println("      " + e.getMessage());
         } catch (AssertionError e) {
             failed++;
             System.out.println("FAIL  " + name);
@@ -1030,6 +1401,54 @@ public class StorageNodeTest {
     /** Shows an ID in quotes, with invisible characters made visible, for failure messages. */
     private static String show(String id) {
         return "\"" + id.replace("\t", "\\t").replace("\u0000", "\\0") + "\"";
+    }
+
+    /** Thrown by a test that cannot run here; runTest reports it as skipped, never as passed. */
+    private static final class SkipTest extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        SkipTest(String reason) {
+            super(reason);
+        }
+    }
+
+    /**
+     * Creates a symbolic link to a file, or skips the test if this account may not create one
+     * (on Windows that needs Developer Mode or admin rights). Any other failure fails the test.
+     */
+    private static void createFileSymlinkOrSkip(Path link, Path target) throws IOException {
+        try {
+            Files.createSymbolicLink(link, target);
+        } catch (UnsupportedOperationException e) {
+            throw new SkipTest("SKIPPED: symbolic links are not supported here (" + e + ")");
+        } catch (FileSystemException e) {
+            String message = String.valueOf(e.getMessage()).toLowerCase(Locale.ROOT);
+            if (!message.contains("privilege")) {
+                throw e;
+            }
+            throw new SkipTest("SKIPPED: this account may not create symbolic links (Windows needs Developer Mode"
+                    + " or admin rights): " + e.getMessage());
+        }
+    }
+
+    /** Creates a directory junction (mklink /J, no admin rights needed), as DistributedFsDemoTest does. */
+    private static void createDirectoryJunction(Path link, Path target) throws IOException {
+        Process process = new ProcessBuilder("cmd.exe", "/c", "mklink", "/J", link.toString(), target.toString())
+                .redirectErrorStream(true)
+                .start();
+        String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        int exitCode;
+        try {
+            exitCode = process.waitFor();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted while creating a junction", e);
+        }
+        if (exitCode != 0) {
+            throw new IOException("mklink /J failed with exit code " + exitCode + ": " + output.trim());
+        }
+        BasicFileAttributes attributes = Files.readAttributes(link, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        check(attributes.isOther(), "the planted entry is not a junction");
     }
 
     /** Names of the entries in a directory, sorted, so tests can compare them with a fixed list. */
