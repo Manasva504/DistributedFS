@@ -107,7 +107,7 @@ public class UploadEndpointTest {
         runTest("a connection reset during the upload leaves nothing behind", UploadEndpointTest::resetDuringUpload);
 
         // Routing and Host
-        runTest("other methods on /files are 405 with Allow: POST; /files/ and /files/<id> are 404",
+        runTest("other methods on /files are 405 with Allow: POST; POST under /files/ is 405 with Allow: GET",
                 UploadEndpointTest::routing);
         runTest("a bad Host is 403 before the upload is looked at", UploadEndpointTest::badHostIsRefused);
 
@@ -441,8 +441,14 @@ public class UploadEndpointTest {
                 checkContains(text.toLowerCase(Locale.ROOT), "\r\nallow: post\r\n");
                 check(text.endsWith("\r\n\r\n"), "HEAD /files has no body: " + text);
             }
-            for (String path : List.of("/files/", "/files/0123456789abcdef0123456789abcdef", "/FILES", "/files%2F",
-                    "/files/..", "/%66iles")) {
+            // A path under /files/ names a file, which only GET reads: POST there is never an upload.
+            for (String path : List.of("/files/", "/files/0123456789abcdef0123456789abcdef", "/files/..")) {
+                RawResponse response = exchange(server, head("POST", path, server, OCTET + "Content-Length: 3\r\n"),
+                        bytes(3, 1));
+                checkErrorResponse(response, ApiError.METHOD_NOT_ALLOWED, server, "POST " + path);
+                checkEquals("GET", response.header("allow"), "POST " + path + ": Allow");
+            }
+            for (String path : List.of("/FILES", "/files%2F", "/%66iles")) {
                 RawResponse response = exchange(server, head("POST", path, server, OCTET + "Content-Length: 3\r\n"),
                         bytes(3, 1));
                 checkErrorResponse(response, ApiError.NOT_FOUND, server, "POST " + path);

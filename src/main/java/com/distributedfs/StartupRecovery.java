@@ -85,8 +85,11 @@ final class StartupRecovery {
     private static final Pattern PENDING_ENTRY =
             Pattern.compile("([0-9a-f]{32})" + Pattern.quote(ManifestStore.PENDING_SUFFIX));
 
-    /** FileService.newUploadWorkspace: {@code Files.createTempDirectory(tmp, "upload-")}, so 1 to 20 digits. */
-    private static final Pattern WORKSPACE_NAME = Pattern.compile("upload-[0-9]{1,20}");
+    /**
+     * FileService.newUploadWorkspace and newDownloadWorkspace: {@code Files.createTempDirectory(tmp,
+     * "upload-")} or {@code "download-"}, so 1 to 20 digits.
+     */
+    private static final Pattern WORKSPACE_NAME = Pattern.compile("(upload|download)-[0-9]{1,20}");
 
     /** What the chunk scan found. */
     enum FindingType {
@@ -554,9 +557,9 @@ final class StartupRecovery {
     }
 
     /**
-     * Deletes request workspaces ({@code upload-<digits>}) left by a killed server. Only plain
-     * folders are deleted, with FileTrees.deleteTree, which never follows a link; a link, junction
-     * or other entry under such a name is left in place and reported.
+     * Deletes request workspaces ({@code upload-<digits>} and {@code download-<digits>}) left by a
+     * killed server. Only plain folders are deleted, with FileTrees.deleteTree, which never follows
+     * a link; a link, junction or other entry under such a name is left in place and reported.
      */
     private int sweepWorkspaces(Consumer<String> warn) {
         int removed = 0;

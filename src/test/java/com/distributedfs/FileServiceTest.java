@@ -18,12 +18,15 @@ import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -92,6 +95,19 @@ public class FileServiceTest {
         // Concurrency
         runTest("concurrent uploads never touch the cluster at the same time", FileServiceTest::uploadsAreSerialized);
         runTest("concurrent uploads never pick the same ID", FileServiceTest::concurrentUploadsGetDistinctIds);
+
+        // Downloads
+        runTest("a download rebuilds the committed file, verified, inside its workspace only",
+                FileServiceTest::downloadRebuildsFile);
+        runTest("a download of the ID of an upload in progress waits for the commit and gets the whole file",
+                FileServiceTest::downloadWaitsForUploadInProgress);
+        runTest("a download of the ID of an upload that fails waits and then finds no file",
+                FileServiceTest::downloadDuringFailingUploadFindsNothing);
+        runTest("a pending marker without a manifest is not a file; with a manifest the file is served",
+                FileServiceTest::pendingMarkersAndDownloads);
+        runTest("each download failure has its own reason and changes nothing in the storage",
+                FileServiceTest::downloadFailureReasons);
+        runTest("an invalid file ID is refused before the storage is touched", FileServiceTest::downloadRejectsInvalidId);
 
         // Workspaces and settings
         runTest("workspaces are created in the tmp folder and deleted afterwards", FileServiceTest::workspaces);
@@ -502,6 +518,175 @@ public class FileServiceTest {
     }
 
     // ---------------------------------------------------------------------
+    // Downloads
+    // ---------------------------------------------------------------------
+
+    private static void downloadRebuildsFile(Path tempDir) throws Exception {
+        Fixture f = new Fixture(tempDir);
+        FileService service = f.service(4, ids(id(1), id(2)));
+        byte[] data = bytes(10, 5);
+        FileManifest manifest = store(service, data, null);
+        FileManifest empty = store(service, new byte[0], null);
+        Map<String, String> before = f.snapshot();
+
+        Path workspace = service.newDownloadWorkspace();
+        checkEquals(f.tmpDir, workspace.getParent(), "the workspace's folder");
+        check(workspace.getFileName().toString().matches("download-[0-9]{1,20}"), "workspace name " + workspace);
+        try {
+            FileService.Download download = service.download(id(1), workspace);
+            checkEquals(manifest, download.manifest(), "the manifest");
+            checkEquals(workspace, download.file().getParent(), "the file is in the workspace");
+            check(Arrays.equals(data, Files.readAllBytes(download.file())), "the rebuilt bytes");
+            checkEquals(List.of("chunks", "file"), listNames(workspace), "the workspace");
+            checkEquals(List.of(), listNames(workspace.resolve("chunks")), "chunk copies left after rebuilding");
+        } finally {
+            service.deleteWorkspace(workspace);
+        }
+        check(Arrays.equals(new byte[0], downloadBytes(service, empty.fileId())), "the empty file");
+        checkEquals(List.of(), listNames(f.tmpDir), "tmp after the downloads");
+        checkEquals(before, f.snapshot(), "the storage after the downloads");
+    }
+
+    private static void downloadWaitsForUploadInProgress(Path tempDir) throws Exception {
+        Fixture f = new Fixture(tempDir);
+        f.rules.gateChunk = id(1) + "_1";
+        FileService service = f.service(4, ids(id(1)));
+        byte[] data = bytes(10, 3);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<FileManifest> upload = pool.submit(() -> store(service, data, null));
+            check(f.rules.gateEntered.await(10, TimeUnit.SECONDS), "the upload reached its second chunk");
+            // The upload holds the storage lock: its marker and first chunk exist, its manifest does not.
+            check(f.manifests.readPending(id(1)).isPresent(), "the pending marker of the upload in progress");
+            check(f.manifests.read(id(1)).isEmpty(), "no manifest yet");
+
+            Future<byte[]> download = pool.submit(() -> downloadBytes(service, id(1)));
+            Thread.sleep(300);
+            check(!download.isDone(), "the download waits while the upload holds the storage lock");
+
+            f.rules.gateRelease.countDown();
+            checkEquals(id(1), upload.get(10, TimeUnit.SECONDS).fileId(), "the upload's file ID");
+            check(Arrays.equals(data, download.get(10, TimeUnit.SECONDS)), "the download got the whole committed file");
+        } finally {
+            f.rules.gateRelease.countDown();
+            pool.shutdownNow();
+        }
+        checkEquals(List.of(), f.manifests.listPendingFileIds(), "pending markers");
+        checkEquals(List.of(), listNames(f.tmpDir), "tmp");
+    }
+
+    private static void downloadDuringFailingUploadFindsNothing(Path tempDir) throws Exception {
+        Fixture f = new Fixture(tempDir);
+        f.rules.gateChunk = id(1) + "_1";
+        f.rules.failStore.add(id(1) + "_2");
+        FileService service = f.service(4, ids(id(1)));
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<FileManifest> upload = pool.submit(() -> store(service, bytes(10, 3), null));
+            check(f.rules.gateEntered.await(10, TimeUnit.SECONDS), "the upload reached its second chunk");
+            Future<byte[]> download = pool.submit(() -> downloadBytes(service, id(1)));
+            Thread.sleep(300);
+            check(!download.isDone(), "the download waits while the upload holds the storage lock");
+
+            f.rules.gateRelease.countDown();
+            ExecutionException uploadFailure = expectThrows(ExecutionException.class, () -> upload.get(10, TimeUnit.SECONDS));
+            check(uploadFailure.getCause() instanceof FileServiceException,
+                    "the upload failed with a FileServiceException: " + uploadFailure.getCause());
+            ExecutionException downloadFailure =
+                    expectThrows(ExecutionException.class, () -> download.get(10, TimeUnit.SECONDS));
+            check(downloadFailure.getCause() instanceof FileServiceException e
+                            && e.reason() == FileServiceException.Reason.FILE_NOT_FOUND,
+                    "the download found no file after the rollback: " + downloadFailure.getCause());
+        } finally {
+            f.rules.gateRelease.countDown();
+            pool.shutdownNow();
+        }
+        f.checkNothingStored();
+        checkEquals(List.of(), listNames(f.tmpDir), "tmp");
+    }
+
+    private static void pendingMarkersAndDownloads(Path tempDir) throws Exception {
+        Fixture f = new Fixture(tempDir);
+        FileService service = f.service(4, ids(id(2)));
+
+        // An upload that never committed: a marker and one stored chunk, but no manifest.
+        f.manifests.createPending(new ManifestStore.PendingUpload(id(1), 2));
+        f.cluster.storeChunk(id(1) + "_0", Files.write(tempDir.resolve("source"), bytes(4, 1)));
+        Map<String, String> before = f.snapshot();
+        checkDownloadFails(service, id(1), FileServiceException.Reason.FILE_NOT_FOUND);
+        checkEquals(before, f.snapshot(), "the marker and the chunk of the uncommitted upload");
+
+        // A committed file whose marker could not be deleted is still a file.
+        byte[] data = bytes(9, 2);
+        FileManifest manifest = store(service, data, null);
+        f.manifests.createPending(new ManifestStore.PendingUpload(id(2), manifest.chunkCount()));
+        check(Arrays.equals(data, downloadBytes(service, id(2))), "the committed file with a leftover marker");
+        check(f.manifests.readPending(id(2)).isPresent(), "the download leaves the marker alone");
+        checkEquals(List.of(), listNames(f.tmpDir), "tmp");
+    }
+
+    private static void downloadFailureReasons(Path tempDir) throws Exception {
+        Fixture f = new Fixture(tempDir);
+        FileService service = f.service(4, ids(id(1), id(2), id(3), id(4), id(5)));
+        for (int i = 1; i <= 5; i++) {
+            store(service, bytes(10, i), null); // chunks _0 and _1 of 4 bytes, _2 of 2 bytes
+        }
+        Files.writeString(f.manifestsDir.resolve(id(1) + ".manifest"), "format=1\nnot a manifest\n");
+        Files.delete(f.chunkFile(id(2) + "_1"));
+        Path flipped = f.chunkFile(id(3) + "_2");
+        byte[] content = Files.readAllBytes(flipped);
+        content[0] ^= 1;
+        Files.write(flipped, content);
+        Files.write(f.chunkFile(id(4) + "_2"), new byte[1]); // one byte short
+        Map<String, String> before = f.snapshot();
+
+        checkDownloadFails(service, id(1), FileServiceException.Reason.METADATA_CORRUPT);
+        checkDownloadFails(service, id(2), FileServiceException.Reason.CHUNK_MISSING);
+        checkDownloadFails(service, id(3), FileServiceException.Reason.INTEGRITY_CHECK_FAILED);
+        checkDownloadFails(service, id(4), FileServiceException.Reason.INTEGRITY_CHECK_FAILED);
+        checkDownloadFails(service, id(9), FileServiceException.Reason.FILE_NOT_FOUND);
+        f.manifests.failRead = true;
+        checkDownloadFails(service, id(5), FileServiceException.Reason.STORAGE_ERROR);
+        f.manifests.failRead = false;
+        check(Arrays.equals(bytes(10, 5), downloadBytes(service, id(5))), "the undamaged file is still served");
+
+        checkEquals(before, f.snapshot(), "the storage after the failed downloads");
+        checkEquals(List.of(), listNames(f.tmpDir), "tmp");
+    }
+
+    private static void downloadRejectsInvalidId(Path tempDir) throws Exception {
+        Fixture f = new Fixture(tempDir);
+        FileService service = f.service(4, ids());
+        Path workspace = service.newDownloadWorkspace();
+        try {
+            List<String> invalid = Arrays.asList(null, "", "../" + id(1), id(1).toUpperCase(Locale.ROOT).replace('0', 'A'),
+                    id(1) + "0", "%30" + id(1).substring(1), id(1).substring(1) + "/");
+            for (String bad : invalid) {
+                expectThrows(IllegalArgumentException.class, () -> service.download(bad, workspace));
+            }
+            checkEquals(List.of(), listNames(workspace), "nothing was written to the workspace");
+        } finally {
+            service.deleteWorkspace(workspace);
+        }
+        checkEquals(List.of(), listNames(f.tmpDir), "tmp");
+    }
+
+    /** Downloads the way the HTTP handler does: in a new workspace, deleted afterwards. */
+    private static byte[] downloadBytes(FileService service, String fileId) throws IOException {
+        Path workspace = service.newDownloadWorkspace();
+        try {
+            return Files.readAllBytes(service.download(fileId, workspace).file());
+        } finally {
+            service.deleteWorkspace(workspace);
+        }
+    }
+
+    private static void checkDownloadFails(FileService service, String fileId, FileServiceException.Reason expected) {
+        FileServiceException e = expectThrows(FileServiceException.class, () -> downloadBytes(service, fileId));
+        checkEquals(expected, e.reason(), "the reason a download of " + fileId + " failed");
+    }
+
+    // ---------------------------------------------------------------------
     // Fixture
     // ---------------------------------------------------------------------
 
@@ -515,6 +700,10 @@ public class FileServiceTest {
         final AtomicInteger inFlight = new AtomicInteger();
         final AtomicInteger maxInFlight = new AtomicInteger();
         volatile long storeDelayMillis = 0;
+        /** A store of this chunk ID signals gateEntered, then waits for gateRelease. */
+        volatile String gateChunk;
+        final CountDownLatch gateEntered = new CountDownLatch(1);
+        final CountDownLatch gateRelease = new CountDownLatch(1);
     }
 
     /** A real storage node that follows NodeRules. */
@@ -532,6 +721,17 @@ public class FileServiceTest {
             int now = rules.inFlight.incrementAndGet();
             rules.maxInFlight.accumulateAndGet(now, Math::max);
             try {
+                if (chunkId.equals(rules.gateChunk)) {
+                    rules.gateEntered.countDown();
+                    try {
+                        if (!rules.gateRelease.await(10, TimeUnit.SECONDS)) {
+                            throw new IOException("the test never released the gate");
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException(e);
+                    }
+                }
                 if (rules.storeDelayMillis > 0) {
                     try {
                         Thread.sleep(rules.storeDelayMillis);
@@ -659,6 +859,29 @@ public class FileServiceTest {
         void checkNothingStored() throws IOException {
             checkEquals(0, storedChunkFiles(), "chunk files on the nodes");
             checkEquals(List.of(), listNames(manifestsDir), "manifest folder");
+        }
+
+        /** The stored chunk file with this ID, on whichever node holds it. */
+        Path chunkFile(String chunkId) {
+            for (Path dir : nodeDirs) {
+                if (Files.exists(dir.resolve(chunkId))) {
+                    return dir.resolve(chunkId);
+                }
+            }
+            throw new AssertionError("no node holds " + chunkId);
+        }
+
+        /** Every manifest, marker and chunk file, by name, with its SHA-256. */
+        Map<String, String> snapshot() throws IOException {
+            Map<String, String> files = new TreeMap<>();
+            List<Path> dirs = new ArrayList<>(nodeDirs);
+            dirs.add(manifestsDir);
+            for (Path dir : dirs) {
+                for (String name : listNames(dir)) {
+                    files.put(dir.getFileName() + "/" + name, sha256(Files.readAllBytes(dir.resolve(name))));
+                }
+            }
+            return files;
         }
 
         /** Retrieves every chunk of {@code manifest} in order and returns the bytes joined. */

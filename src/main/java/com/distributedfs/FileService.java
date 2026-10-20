@@ -11,13 +11,16 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * Stores files: hashing, chunking, placing the chunks on the cluster, and recording the file's
- * manifest. It knows nothing about HTTP.
+ * Stores files (hashing, chunking, placing the chunks on the cluster, and recording the file's
+ * manifest) and prepares them for download. It knows nothing about HTTP.
  *
- * <p><b>One storage lock.</b> StorageCluster is not thread-safe, and an upload is several steps
- * (pending marker, chunks, manifest) that must not interleave with another upload's. Every step
- * that touches the cluster or the manifests runs while holding one lock. Hashing and chunking,
- * which only touch the request's own workspace, run outside it.
+ * <p><b>One storage lock.</b> StorageCluster and ManifestStore are not thread-safe, and an upload
+ * is several steps (pending marker, chunks, manifest) that must not interleave with another
+ * upload's or with a download reading the same storage. Every step that touches the cluster or
+ * the manifests, for uploads and downloads alike, runs while holding one lock. Hashing, chunking,
+ * rebuilding and checking, which only touch the request's own workspace, run outside it. The lock
+ * covers the whole storage rather than one file ID because the cluster and the manifest store are
+ * shared by every file.
  *
  * <p><b>Store, step by step</b> ({@link #store}):
  * <ol>
@@ -36,13 +39,35 @@ import java.util.Optional;
  * kept (so the leftover chunks stay on record for startup recovery) and the delete failures are
  * attached to the thrown exception as suppressed. A failed manifest write is never rolled back on
  * assumption: see {@link #resolveFailedCommit}.
+ *
+ * <p><b>Download, step by step</b> ({@link #download}):
+ * <ol>
+ *   <li>Holding the lock: read the manifest, then copy the file's chunks, in order, from the
+ *       cluster into the request's workspace. The manifest alone decides whether the file
+ *       exists: it is the upload's commit point, so a pending marker without a manifest is an
+ *       upload that never committed (not found), and a manifest with a leftover marker is a
+ *       committed file whose marker could not be deleted (served). Because uploads write the
+ *       manifest last and roll back only uploads without one, all under the same lock, a
+ *       download never sees a half-stored or half-rolled-back file.</li>
+ *   <li>Without the lock: rebuild the file from the copies, delete the copies, and check the
+ *       result's size and SHA-256 against the manifest. Only a file that passes is returned.</li>
+ * </ol>
  */
 class FileService {
 
     /** How many file IDs to try before giving up; a collision of random 128-bit IDs is not expected. */
     static final int ID_ATTEMPTS = 3;
 
+    /** Workspace names; StartupRecovery removes stale workspaces by exactly these prefixes. */
     private static final String WORKSPACE_PREFIX = "upload-";
+    private static final String DOWNLOAD_WORKSPACE_PREFIX = "download-";
+
+    /**
+     * A file ready to be sent: its manifest and its rebuilt, verified copy in the request's
+     * workspace. {@code file} has exactly {@code manifest.size()} bytes and the manifest's SHA-256.
+     */
+    record Download(FileManifest manifest, Path file) {
+    }
 
     /** Supplies new file IDs. Tests replace it to force collisions. */
     interface IdGenerator {
@@ -87,6 +112,11 @@ class FileService {
         return Files.createTempDirectory(tmpDir, WORKSPACE_PREFIX);
     }
 
+    /** Creates a new, empty workspace for one download: a folder named download-(digits) in the tmp folder. */
+    Path newDownloadWorkspace() throws IOException {
+        return Files.createTempDirectory(tmpDir, DOWNLOAD_WORKSPACE_PREFIX);
+    }
+
     /**
      * Deletes a request's workspace without following links (see {@link FileTrees#deleteTree}).
      * A failure is logged, not thrown: the request's outcome does not depend on it.
@@ -129,6 +159,90 @@ class FileService {
         synchronized (storageLock) {
             return storeLocked(chunks, size, sha256);
         }
+    }
+
+    /**
+     * Rebuilds the committed file {@code fileId} inside {@code workspace} and verifies it, as
+     * described in the class comment. Everything this writes stays inside {@code workspace}; the
+     * caller deletes the workspace afterwards, whatever happened.
+     *
+     * @param fileId    a valid file ID (the caller has checked it)
+     * @param workspace this request's new, empty download workspace
+     * @return the manifest and the verified file
+     * @throws IllegalArgumentException if {@code fileId} is not a valid file ID
+     * @throws FileServiceException with FILE_NOT_FOUND (no manifest), METADATA_CORRUPT (the
+     *         manifest cannot be trusted), CHUNK_MISSING (every node confirms a chunk is gone),
+     *         INTEGRITY_CHECK_FAILED (the rebuilt file's size or SHA-256 differs from the
+     *         manifest), or STORAGE_ERROR (anything else that stopped the file from being read)
+     */
+    Download download(String fileId, Path workspace) throws FileServiceException {
+        Objects.requireNonNull(workspace, "workspace must not be null");
+        if (!FileIds.isValid(fileId)) {
+            throw new IllegalArgumentException("fileId is not a valid file ID");
+        }
+        FileManifest manifest;
+        List<Path> copies = new ArrayList<>();
+        Path copiesDir = workspace.resolve("chunks");
+        synchronized (storageLock) {
+            manifest = readManifestForDownload(fileId);
+            for (int i = 0; i < manifest.chunkCount(); i++) {
+                String chunkId = manifest.chunkId(i);
+                Path copy = copiesDir.resolve(chunkId);
+                try {
+                    cluster.retrieveChunk(chunkId, copy);
+                } catch (ChunkNotFoundException e) {
+                    throw new FileServiceException(FileServiceException.Reason.CHUNK_MISSING,
+                            "file " + fileId + " is committed, but every node confirms its chunk " + chunkId
+                                    + " is gone", e);
+                } catch (IOException | RuntimeException e) {
+                    throw storageError("chunk " + chunkId + " of file " + fileId + " could not be read", e);
+                }
+                copies.add(copy);
+            }
+        }
+
+        // The copies are this request's own; nothing below needs the lock.
+        Path file = workspace.resolve("file");
+        long size;
+        String sha256;
+        try {
+            new FileReconstructor().reconstruct(copies, file);
+            for (Path copy : copies) {
+                try {
+                    Files.deleteIfExists(copy); // only to save disk space while the file is sent
+                } catch (IOException ignored) {
+                    // the workspace deletion after the request removes it
+                }
+            }
+            size = Files.size(file);
+            sha256 = new ChecksumService().calculateSha256(file);
+        } catch (IOException | RuntimeException e) {
+            throw storageError("file " + fileId + " could not be rebuilt in its download workspace", e);
+        }
+        if (size != manifest.size() || !sha256.equals(manifest.sha256())) {
+            throw new FileServiceException(FileServiceException.Reason.INTEGRITY_CHECK_FAILED,
+                    "file " + fileId + " was rebuilt with " + size + " bytes and SHA-256 " + sha256
+                            + ", but its manifest says " + manifest.size() + " bytes and " + manifest.sha256(), null);
+        }
+        return new Download(manifest, file);
+    }
+
+    /** The manifest of a file to download. Must be called holding the storage lock. */
+    private FileManifest readManifestForDownload(String fileId) throws FileServiceException {
+        Optional<FileManifest> manifest;
+        try {
+            manifest = manifests.read(fileId);
+        } catch (InvalidManifestException e) {
+            throw new FileServiceException(FileServiceException.Reason.METADATA_CORRUPT,
+                    "the manifest of file " + fileId + " cannot be trusted", e);
+        } catch (IOException | RuntimeException e) {
+            throw storageError("the manifest of file " + fileId + " could not be read", e);
+        }
+        if (manifest.isEmpty()) {
+            throw new FileServiceException(FileServiceException.Reason.FILE_NOT_FOUND,
+                    "no manifest exists for file " + fileId, null);
+        }
+        return manifest.get();
     }
 
     /** Steps 3 and 4 of the class comment. Must be called holding the storage lock. */

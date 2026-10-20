@@ -105,6 +105,8 @@ public class StartupRecoveryTest {
         runTest("a temp file that cannot be deleted is only a warning", StartupRecoveryTest::undeletableTempIsWarning);
         runTest("a stale workspace with a junction inside is removed without touching the junction's target",
                 StartupRecoveryTest::workspaceWithJunctionIsRemovedSafely);
+        runTest("a stale download workspace is removed like an upload workspace; look-alike names stay",
+                StartupRecoveryTest::staleDownloadWorkspaceIsRemoved);
 
         // Chunk scan
         runTest("the chunk scan reports orphans, extra chunks and unreadable manifests, and deletes nothing",
@@ -572,6 +574,23 @@ public class StartupRecoveryTest {
         checkEquals(1, result.tempItemsRemoved(), "the workspace was removed");
         checkEquals(List.of(), listNames(f.tmpDir), "tmp");
         checkEquals("precious", Files.readString(target.resolve("precious")), "the junction's target file");
+    }
+
+    private static void staleDownloadWorkspaceIsRemoved(Path tempDir) throws Exception {
+        Fixture f = new Fixture(tempDir);
+        // What a server killed in the middle of a download leaves: chunk copies and a partly rebuilt file.
+        Path workspace = Files.createDirectories(f.tmpDir.resolve("download-4567"));
+        Files.createDirectories(workspace.resolve("chunks"));
+        Files.writeString(workspace.resolve("chunks").resolve(F + "_0"), "copy");
+        Files.writeString(workspace.resolve("file"), "partly rebuilt");
+        Files.createDirectories(f.tmpDir.resolve("download-")); // no digits: not a workspace name
+        Files.createDirectories(f.tmpDir.resolve("downloads-1")); // not the exact prefix
+
+        StartupRecovery.Result result = f.recover();
+
+        checkEquals(1, result.tempItemsRemoved(), "workspaces removed");
+        checkEquals(List.of("download-", "downloads-1"), listNames(f.tmpDir), "tmp after recovery");
+        checkContains(f.errText(), "Left an unexpected entry in the tmp folder in place");
     }
 
     // ---------------------------------------------------------------------
