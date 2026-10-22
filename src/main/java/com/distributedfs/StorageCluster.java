@@ -32,6 +32,11 @@ import java.util.Objects;
  * a plain {@link IOException} rather than returning {@code false} or throwing
  * {@link ChunkNotFoundException}.
  *
+ * <p><b>Deleting.</b> {@link #deleteChunk(String)} checks every node before deleting anything,
+ * with a check that never follows links (see {@link StorageNode#deleteChunk}). It deletes only
+ * when every node answered clearly and exactly one holds the chunk; otherwise nothing is deleted.
+ * It does not change the round-robin position.
+ *
  * <p><b>Single-threaded.</b> A StorageCluster must be used from one thread at a time, and its
  * nodes should not be written to by anything else meanwhile. Checking every node and then storing
  * is not atomic, so two threads, two clusters sharing nodes, or a caller storing through a
@@ -202,6 +207,46 @@ public class StorageCluster {
                 "Chunk \"" + chunkId + "\" is not stored on any of the " + nodes.size() + " nodes in this cluster");
     }
 
+    /**
+     * Deletes the chunk from the one node that holds it.
+     *
+     * <p>First every node is asked, and nothing is deleted while asking. The question is not
+     * {@link #hasChunk}, which follows links, but a stricter one: a node holds the chunk only if
+     * its storage directory is a plain directory and the chunk's entry is a regular file, both read
+     * without following links. The chunk is deleted only if every node answered, and exactly one
+     * holds it. The round-robin position for stores is not changed.
+     *
+     * <p>Like the rest of this class, this assumes a single thread and nodes that nothing else
+     * writes to: checking the nodes and then deleting is not atomic.
+     *
+     * @return {@code true} if the chunk was deleted from its node; {@code false} if every node
+     *         confirms it does not hold the chunk, or the holding node found it already gone when
+     *         deleting (which that node confirms by checking again)
+     * @throws NullPointerException if {@code chunkId} is null
+     * @throws IllegalArgumentException if the chunk ID is invalid (checked before any node's
+     *         files are read)
+     * @throws IOException if some node could not be checked safely (for example its storage is
+     *         unavailable, or the entry under the chunk's ID is a link, junction or directory) or
+     *         more than one node holds the chunk, in which cases nothing is deleted; or exactly
+     *         what the holding node's {@link StorageNode#deleteChunk} throws
+     */
+    public boolean deleteChunk(String chunkId) throws IOException {
+        Objects.requireNonNull(chunkId, "chunkId must not be null");
+        NodeAnswers answers = askEveryNodeForDeletion(chunkId);
+        if (!answers.errors.isEmpty()) {
+            throw withNodeErrors("Cannot delete chunk \"" + chunkId + "\": " + describeNodes(answers.uncheckedNodes)
+                    + " could not be checked safely, so nothing was deleted", answers.errors);
+        }
+        if (answers.holders.size() > 1) {
+            throw new IOException("Chunk \"" + chunkId + "\" is stored on more than one node ("
+                    + describeNodes(answers.holders) + "); refusing to delete any copy");
+        }
+        if (answers.holders.isEmpty()) {
+            return false;
+        }
+        return nodes.get(answers.holders.get(0)).deleteChunk(chunkId);
+    }
+
     /** What every node said about one chunk ID. */
     private static final class NodeAnswers {
         final List<Integer> holders = new ArrayList<>();        // nodes that hold the chunk
@@ -218,6 +263,26 @@ public class StorageCluster {
         for (int i = 0; i < nodes.size(); i++) {
             try {
                 if (nodes.get(i).hasChunk(chunkId)) {
+                    answers.holders.add(i);
+                }
+            } catch (IOException e) {
+                answers.uncheckedNodes.add(i);
+                answers.errors.add(e);
+            }
+        }
+        return answers;
+    }
+
+    /**
+     * Like {@link #askEveryNode}, but with the no-follow question deleting needs
+     * ({@link StorageNode#holdsRegularChunkFile}). An invalid ID is rejected by node 0 with
+     * IllegalArgumentException before any file is read.
+     */
+    private NodeAnswers askEveryNodeForDeletion(String chunkId) {
+        NodeAnswers answers = new NodeAnswers();
+        for (int i = 0; i < nodes.size(); i++) {
+            try {
+                if (nodes.get(i).holdsRegularChunkFile(chunkId)) {
                     answers.holders.add(i);
                 }
             } catch (IOException e) {

@@ -5,13 +5,18 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.Random;
 import java.util.stream.Stream;
@@ -38,6 +43,7 @@ public class StorageClusterTest {
 
     private static int passed = 0;
     private static int failed = 0;
+    private static int skipped = 0;
 
     public static void main(String[] args) {
         boolean stressMode = args.length == 1 && args[0].equals("--stress");
@@ -54,7 +60,7 @@ public class StorageClusterTest {
         }
 
         System.out.println();
-        System.out.println(passed + " passed, " + failed + " failed");
+        System.out.println(passed + " passed, " + failed + " failed" + (skipped > 0 ? ", " + skipped + " skipped" : ""));
         if (failed > 0) {
             System.exit(1);
         }
@@ -110,6 +116,29 @@ public class StorageClusterTest {
                 StorageClusterTest::allNodesFail);
         runTest("a node failing mid-retrieve passes its error through and leaves no partial file",
                 StorageClusterTest::holderFailsMidRetrieve);
+
+        // Deleting
+        runTest("deleteChunk deletes from the sole holder only, without using the link-following hasChunk",
+                StorageClusterTest::deleteFromSoleHolder);
+        runTest("deleteChunk returns false only after every node confirmed it has no such chunk",
+                StorageClusterTest::deleteMissingChunkChecksEveryNode);
+        runTest("deleteChunk refuses an ID found on two nodes and deletes neither copy",
+                StorageClusterTest::deleteRefusesDuplicates);
+        runTest("deleteChunk with an unavailable node fails, deletes nothing, and never says 'not found'",
+                StorageClusterTest::deleteWithUnavailableNodeFails);
+        runTest("deleteChunk with a node whose check fails deletes nothing", StorageClusterTest::deleteWithFailingCheckFails);
+        runTest("an unsafe entry under the chunk's ID on any node blocks deletion and is left untouched",
+                StorageClusterTest::deleteRefusesUnsafeEntries);
+        runTest("a node whose storage folder became a junction blocks deletion and nothing behind it changes",
+                StorageClusterTest::deleteRefusesJunctionedStorageDir);
+        runTest("the holder's delete failure is passed through and the chunk stays",
+                StorageClusterTest::deleteFailureOnHolderPropagates);
+        runTest("a chunk that vanishes on its holder just before the delete is reported as absent",
+                StorageClusterTest::deleteRaceOnHolderReturnsFalse);
+        runTest("deleting does not move the round-robin position", StorageClusterTest::deleteKeepsPlacement);
+        runTest("deleteChunk rejects null and invalid IDs and changes nothing", StorageClusterTest::deleteRejectsInvalidIds);
+        runTest("a symbolic link to a regular file under the chunk's ID blocks deletion and is left untouched",
+                StorageClusterTest::deleteRefusesFileSymlinkEntry);
 
         // Integration
         runTest("FileChunker -> StorageCluster -> FileReconstructor, checked with ChecksumService",
@@ -695,6 +724,256 @@ public class StorageClusterTest {
     }
 
     // ---------------------------------------------------------------------
+    // Deleting
+    // ---------------------------------------------------------------------
+
+    private static void deleteFromSoleHolder(Path tempDir) throws IOException {
+        List<RecordingNode> nodes = recordingNodes(tempDir, 3);
+        StorageCluster cluster = new StorageCluster(new ArrayList<>(nodes));
+        List<byte[]> contents = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            contents.add(randomBytes(100 + i, i));
+            cluster.storeChunk("chunk_" + i, Files.write(tempDir.resolve("source_" + i), contents.get(i)));
+        }
+        // From here on, any call to the link-following hasChunk fails the test.
+        nodes.forEach(node -> node.forbidHasChunk = true);
+
+        check(cluster.deleteChunk("chunk_1"), "deleting chunk_1 should return true");
+
+        checkEquals(List.of(), listNames(nodeDir(tempDir, 1)), "files on node 1");
+        checkBytes(contents.get(0), nodeDir(tempDir, 0).resolve("chunk_0"));
+        checkBytes(contents.get(2), nodeDir(tempDir, 2).resolve("chunk_2"));
+        checkEquals(List.of(1, 1, 1), nodes.stream().map(node -> node.deletionChecks).toList(), "deletion checks per node");
+        checkEquals(List.of(0, 1, 0), nodes.stream().map(node -> node.deletes).toList(), "deletes per node");
+        nodes.forEach(node -> node.forbidHasChunk = false);
+        check(!cluster.hasChunk("chunk_1"), "the cluster should no longer have chunk_1");
+    }
+
+    private static void deleteMissingChunkChecksEveryNode(Path tempDir) throws IOException {
+        List<RecordingNode> nodes = recordingNodes(tempDir, 3);
+        StorageCluster cluster = new StorageCluster(new ArrayList<>(nodes));
+        byte[] data = randomBytes(100, 0);
+        cluster.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), data));
+
+        check(!cluster.deleteChunk("chunk_9"), "a chunk on no node should give false");
+
+        checkEquals(List.of(1, 1, 1), nodes.stream().map(node -> node.deletionChecks).toList(), "deletion checks per node");
+        checkEquals(List.of(0, 0, 0), nodes.stream().map(node -> node.deletes).toList(), "deletes per node");
+        checkBytes(data, nodeDir(tempDir, 0).resolve("chunk_0"));
+    }
+
+    private static void deleteRefusesDuplicates(Path tempDir) throws IOException {
+        List<RecordingNode> nodes = recordingNodes(tempDir, 3);
+        StorageCluster cluster = new StorageCluster(new ArrayList<>(nodes));
+        byte[] stored = randomBytes(100, 1);
+        byte[] planted = randomBytes(100, 2);
+        cluster.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), stored));
+        Files.write(nodeDir(tempDir, 2).resolve("chunk_0"), planted); // a second copy, bypassing the cluster
+
+        IOException e = expectThrows(IOException.class, () -> cluster.deleteChunk("chunk_0"));
+
+        checkContains(e.getMessage(), "more than one node (nodes [0, 2])");
+        checkBytes(stored, nodeDir(tempDir, 0).resolve("chunk_0"));
+        checkBytes(planted, nodeDir(tempDir, 2).resolve("chunk_0"));
+        checkEquals(List.of(0, 0, 0), nodes.stream().map(node -> node.deletes).toList(), "deletes per node");
+    }
+
+    private static void deleteWithUnavailableNodeFails(Path tempDir) throws IOException {
+        List<RecordingNode> nodes = recordingNodes(tempDir, 3);
+        StorageCluster cluster = new StorageCluster(new ArrayList<>(nodes));
+        byte[] data = randomBytes(100, 0);
+        cluster.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), data));
+        deleteRecursively(nodeDir(tempDir, 1)); // node 1 loses its storage
+
+        // chunk_0 is on healthy node 0, but node 1 could hold a second copy, so nothing is deleted.
+        IOException e = expectThrows(IOException.class, "chunk_0", () -> cluster.deleteChunk("chunk_0"));
+        checkContains(e.getMessage(), "node 1 could not be checked safely");
+        checkEquals(1, e.getSuppressed().length, "number of node errors attached");
+        checkBytes(data, nodeDir(tempDir, 0).resolve("chunk_0"));
+
+        // A chunk on no healthy node is "cannot tell", never "not found".
+        IOException e2 = expectThrows(IOException.class, "chunk_9", () -> cluster.deleteChunk("chunk_9"));
+        checkContains(e2.getMessage(), "could not be checked safely");
+
+        checkEquals(List.of(0, 0, 0), nodes.stream().map(node -> node.deletes).toList(), "deletes per node");
+        check(!Files.exists(nodeDir(tempDir, 1)), "the cluster must not recreate node 1's folder");
+    }
+
+    private static void deleteWithFailingCheckFails(Path tempDir) throws IOException {
+        List<RecordingNode> nodes = recordingNodes(tempDir, 3);
+        StorageCluster cluster = new StorageCluster(new ArrayList<>(nodes));
+        byte[] data = randomBytes(100, 0);
+        cluster.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), data));
+        IOException failure = new IOException("simulated: node 2 cannot read its storage");
+        nodes.get(2).failChecksWith = failure;
+
+        IOException e = expectThrows(IOException.class, () -> cluster.deleteChunk("chunk_0"));
+
+        checkContains(e.getMessage(), "node 2 could not be checked safely");
+        check(e.getSuppressed().length == 1 && e.getSuppressed()[0] == failure, "node 2's own error should be attached");
+        checkBytes(data, nodeDir(tempDir, 0).resolve("chunk_0"));
+        checkEquals(List.of(0, 0, 0), nodes.stream().map(node -> node.deletes).toList(), "deletes per node");
+    }
+
+    private static void deleteRefusesUnsafeEntries(Path tempDir) throws IOException {
+        List<RecordingNode> nodes = recordingNodes(tempDir, 3);
+        StorageCluster cluster = new StorageCluster(new ArrayList<>(nodes));
+        byte[] data = randomBytes(100, 0);
+        cluster.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), data)); // a real chunk on node 0
+        Path outside = Files.createDirectory(tempDir.resolve("outside"));
+        byte[] outsideData = randomBytes(64, 7);
+        Files.write(outside.resolve("precious.bin"), outsideData);
+
+        // Node 1: a directory under the chunk's ID. Node 2: a junction under the chunk's ID.
+        Path directoryEntry = Files.createDirectory(nodeDir(tempDir, 1).resolve("chunk_0"));
+        Files.writeString(directoryEntry.resolve("inside.txt"), "inside");
+        Path junctionEntry = nodeDir(tempDir, 2).resolve("chunk_0");
+        createDirectoryJunction(junctionEntry, outside);
+        // An ID whose only entry is a junction must not be reported as absent either.
+        Path loneJunction = nodeDir(tempDir, 1).resolve("chunk_9");
+        createDirectoryJunction(loneJunction, outside);
+        try {
+            nodes.forEach(node -> node.forbidHasChunk = true);
+
+            IOException e = expectThrows(IOException.class, "chunk_0", () -> cluster.deleteChunk("chunk_0"));
+            checkContains(e.getMessage(), "nodes [1, 2] could not be checked safely");
+            checkEquals(2, e.getSuppressed().length, "number of node errors attached");
+            for (Throwable nodeError : e.getSuppressed()) {
+                checkContains(nodeError.getMessage(), "not a regular file");
+            }
+            IOException e2 = expectThrows(IOException.class, "chunk_9", () -> cluster.deleteChunk("chunk_9"));
+            checkContains(e2.getMessage(), "node 1 could not be checked safely");
+
+            checkEquals(List.of(0, 0, 0), nodes.stream().map(node -> node.deletes).toList(), "deletes per node");
+            checkBytes(data, nodeDir(tempDir, 0).resolve("chunk_0"));
+            check(Files.isDirectory(directoryEntry, LinkOption.NOFOLLOW_LINKS), "the directory entry is left in place");
+            checkEquals("inside", Files.readString(directoryEntry.resolve("inside.txt")), "the file inside the directory");
+            check(Files.exists(junctionEntry, LinkOption.NOFOLLOW_LINKS), "the junction on node 2 is left in place");
+            check(Files.exists(loneJunction, LinkOption.NOFOLLOW_LINKS), "the junction on node 1 is left in place");
+            checkEquals(List.of("precious.bin"), listNames(outside), "files behind the junctions");
+            checkBytes(outsideData, outside.resolve("precious.bin"));
+        } finally {
+            Files.deleteIfExists(junctionEntry); // removes the junctions themselves, never their target
+            Files.deleteIfExists(loneJunction);
+        }
+    }
+
+    private static void deleteRefusesJunctionedStorageDir(Path tempDir) throws IOException {
+        List<RecordingNode> nodes = recordingNodes(tempDir, 3);
+        StorageCluster cluster = new StorageCluster(new ArrayList<>(nodes));
+        // Node 1's folder is replaced by a junction to a folder holding a regular file named chunk_1.
+        Path outside = Files.createDirectory(tempDir.resolve("outside"));
+        byte[] outsideData = randomBytes(64, 7);
+        Files.write(outside.resolve("chunk_1"), outsideData);
+        Files.delete(nodeDir(tempDir, 1));
+        createDirectoryJunction(nodeDir(tempDir, 1), outside);
+        try {
+            IOException e = expectThrows(IOException.class, () -> cluster.deleteChunk("chunk_1"));
+            checkContains(e.getMessage(), "node 1 could not be checked safely");
+            checkContains(e.getSuppressed()[0].getMessage(), "not a plain directory");
+
+            checkEquals(List.of(0, 0, 0), nodes.stream().map(node -> node.deletes).toList(), "deletes per node");
+            check(Files.exists(nodeDir(tempDir, 1), LinkOption.NOFOLLOW_LINKS), "the junction is left in place");
+            checkEquals(List.of("chunk_1"), listNames(outside), "files behind the junction");
+            checkBytes(outsideData, outside.resolve("chunk_1"));
+        } finally {
+            Files.deleteIfExists(nodeDir(tempDir, 1)); // removes the junction itself, never its target
+        }
+    }
+
+    private static void deleteFailureOnHolderPropagates(Path tempDir) throws IOException {
+        List<RecordingNode> nodes = recordingNodes(tempDir, 3);
+        StorageCluster cluster = new StorageCluster(new ArrayList<>(nodes));
+        byte[] data = randomBytes(100, 0);
+        cluster.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), data));
+        IOException failure = new IOException("simulated: the chunk file is in use");
+        nodes.get(0).failDeletesWith = failure;
+
+        IOException e = expectThrows(IOException.class, () -> cluster.deleteChunk("chunk_0"));
+
+        check(e == failure, "the holder's own error should be passed through unchanged, got: " + e);
+        checkBytes(data, nodeDir(tempDir, 0).resolve("chunk_0"));
+        check(cluster.hasChunk("chunk_0"), "the chunk should still be in the cluster");
+    }
+
+    private static void deleteRaceOnHolderReturnsFalse(Path tempDir) throws IOException {
+        List<RecordingNode> nodes = recordingNodes(tempDir, 3);
+        StorageCluster cluster = new StorageCluster(new ArrayList<>(nodes));
+        cluster.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), randomBytes(100, 0)));
+        nodes.get(0).vanishBeforeDelete = true;
+
+        check(!cluster.deleteChunk("chunk_0"), "a chunk already gone at delete time should give false");
+        checkEquals(List.of(), listNames(nodeDir(tempDir, 0)), "files on node 0");
+    }
+
+    private static void deleteKeepsPlacement(Path tempDir) throws IOException {
+        StorageCluster cluster = new StorageCluster(createNodes(tempDir, 3));
+        cluster.storeChunk("chunk_0", Files.write(tempDir.resolve("source_0"), randomBytes(100, 0)));
+        cluster.storeChunk("chunk_1", Files.write(tempDir.resolve("source_1"), randomBytes(100, 1)));
+        checkEquals(1, cluster.locateChunk("chunk_1"), "node holding chunk_1");
+
+        // A successful delete, a delete of a missing chunk, a refused delete and an invalid ID.
+        check(cluster.deleteChunk("chunk_0"), "delete chunk_0");
+        check(!cluster.deleteChunk("chunk_9"), "delete a chunk never stored");
+        Files.write(nodeDir(tempDir, 0).resolve("dup"), randomBytes(10, 3));
+        Files.write(nodeDir(tempDir, 1).resolve("dup"), randomBytes(10, 4));
+        expectThrows(IOException.class, "duplicated ID", () -> cluster.deleteChunk("dup"));
+        expectThrows(IllegalArgumentException.class, "invalid ID", () -> cluster.deleteChunk("../x"));
+
+        // Stores continue exactly where they left off: node 2, then 0, then 1. A deleted ID can be stored again.
+        byte[] newData = randomBytes(120, 5);
+        cluster.storeChunk("chunk_0", Files.write(tempDir.resolve("source_new"), newData));
+        checkEquals(2, cluster.locateChunk("chunk_0"), "node holding the new chunk_0");
+        cluster.storeChunk("chunk_2", Files.write(tempDir.resolve("source_2"), randomBytes(100, 2)));
+        checkEquals(0, cluster.locateChunk("chunk_2"), "node holding chunk_2");
+        cluster.storeChunk("chunk_3", Files.write(tempDir.resolve("source_3"), randomBytes(100, 6)));
+        checkEquals(1, cluster.locateChunk("chunk_3"), "node holding chunk_3");
+
+        Path retrieved = tempDir.resolve("retrieved.bin");
+        cluster.retrieveChunk("chunk_0", retrieved);
+        checkBytes(newData, retrieved);
+    }
+
+    private static void deleteRejectsInvalidIds(Path tempDir) throws IOException {
+        List<RecordingNode> nodes = recordingNodes(tempDir, 3);
+        StorageCluster cluster = new StorageCluster(new ArrayList<>(nodes));
+        cluster.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), randomBytes(100, 0)));
+        List<String> before = listTree(tempDir);
+
+        expectThrows(NullPointerException.class, "null", () -> cluster.deleteChunk(null));
+        for (String id : List.of("", "Chunk_0", "chunk_0.tmp", "../chunk_0", "..\\chunk_0", "con", "a".repeat(129))) {
+            expectThrows(IllegalArgumentException.class, "deleteChunk(\"" + id + "\")", () -> cluster.deleteChunk(id));
+        }
+
+        checkEquals(before, listTree(tempDir), "everything in the test folder");
+        checkEquals(List.of(0, 0, 0), nodes.stream().map(node -> node.deletes).toList(), "deletes per node");
+    }
+
+    /**
+     * A symbolic link to a regular file looks like a chunk to the link-following hasChunk, so only
+     * the no-follow deletion check can refuse it. Skipped, not passed, where this account may not
+     * create symbolic links.
+     */
+    private static void deleteRefusesFileSymlinkEntry(Path tempDir) throws IOException {
+        List<RecordingNode> nodes = recordingNodes(tempDir, 3);
+        StorageCluster cluster = new StorageCluster(new ArrayList<>(nodes));
+        byte[] targetData = randomBytes(64, 7);
+        Path target = Files.write(tempDir.resolve("target.bin"), targetData);
+        Path link = nodeDir(tempDir, 1).resolve("chunk_0");
+        createFileSymlinkOrSkip(link, target);
+        nodes.forEach(node -> node.forbidHasChunk = true);
+
+        IOException e = expectThrows(IOException.class, () -> cluster.deleteChunk("chunk_0"));
+
+        checkContains(e.getMessage(), "node 1 could not be checked safely");
+        checkContains(e.getSuppressed()[0].getMessage(), "not a regular file");
+        checkEquals(List.of(0, 0, 0), nodes.stream().map(node -> node.deletes).toList(), "deletes per node");
+        check(Files.isSymbolicLink(link), "the link is left in place");
+        checkEquals(target, Files.readSymbolicLink(link), "the link still points at its target");
+        checkBytes(targetData, target);
+    }
+
+    // ---------------------------------------------------------------------
     // Nodes and test streams
     // ---------------------------------------------------------------------
 
@@ -727,6 +1006,116 @@ public class StorageClusterTest {
                 return failAfter(Files.readAllBytes(file), 10, failure);
             }
         };
+    }
+
+    /**
+     * A real StorageNode that counts the cluster's deletion checks and delete calls, and can be
+     * told to fail them, to make the chunk vanish just before the delete (through the package-private
+     * deleteChunkFile hook), or to fail any call to the link-following hasChunk.
+     */
+    private static final class RecordingNode extends StorageNode {
+        int deletionChecks = 0;
+        int deletes = 0;
+        boolean forbidHasChunk = false;
+        boolean vanishBeforeDelete = false;
+        IOException failChecksWith = null;
+        IOException failDeletesWith = null;
+
+        RecordingNode(Path dir) throws IOException {
+            super(dir);
+        }
+
+        @Override
+        public boolean hasChunk(String chunkId) throws IOException {
+            if (forbidHasChunk) {
+                throw new AssertionError("deleteChunk must not use hasChunk, which follows links");
+            }
+            return super.hasChunk(chunkId);
+        }
+
+        @Override
+        boolean holdsRegularChunkFile(String chunkId) throws IOException {
+            deletionChecks++;
+            if (failChecksWith != null) {
+                throw failChecksWith;
+            }
+            return super.holdsRegularChunkFile(chunkId);
+        }
+
+        @Override
+        public boolean deleteChunk(String chunkId) throws IOException {
+            deletes++;
+            return super.deleteChunk(chunkId);
+        }
+
+        @Override
+        void deleteChunkFile(Path chunkFile) throws IOException {
+            if (failDeletesWith != null) {
+                throw failDeletesWith;
+            }
+            if (vanishBeforeDelete) {
+                Files.delete(chunkFile);
+                throw new NoSuchFileException(chunkFile.toString());
+            }
+            super.deleteChunkFile(chunkFile);
+        }
+    }
+
+    /** Creates {@code count} RecordingNodes in tempDir/node-0, tempDir/node-1, ... */
+    private static List<RecordingNode> recordingNodes(Path tempDir, int count) throws IOException {
+        List<RecordingNode> nodes = new ArrayList<>();
+        for (int i = 0; i < count; i++) {
+            nodes.add(new RecordingNode(nodeDir(tempDir, i)));
+        }
+        return nodes;
+    }
+
+    /** Thrown by a test that cannot run here; runTest reports it as skipped, never as passed. */
+    private static final class SkipTest extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        SkipTest(String reason) {
+            super(reason);
+        }
+    }
+
+    /**
+     * Creates a symbolic link to a file, or skips the test if this account may not create one
+     * (on Windows that needs Developer Mode or admin rights). Any other failure fails the test.
+     */
+    private static void createFileSymlinkOrSkip(Path link, Path target) throws IOException {
+        try {
+            Files.createSymbolicLink(link, target);
+        } catch (UnsupportedOperationException e) {
+            throw new SkipTest("SKIPPED: symbolic links are not supported here (" + e + ")");
+        } catch (FileSystemException e) {
+            String message = String.valueOf(e.getMessage()).toLowerCase(Locale.ROOT);
+            if (!message.contains("privilege")) {
+                throw e;
+            }
+            throw new SkipTest("SKIPPED: this account may not create symbolic links (Windows needs Developer Mode"
+                    + " or admin rights): " + e.getMessage());
+        }
+    }
+
+    /** Creates a directory junction (mklink /J, no admin rights needed), as DistributedFsDemoTest does. */
+    private static void createDirectoryJunction(Path link, Path target) throws IOException {
+        Process process = new ProcessBuilder("cmd.exe", "/c", "mklink", "/J", link.toString(), target.toString())
+                .redirectErrorStream(true)
+                .start();
+        String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        int exitCode;
+        try {
+            exitCode = process.waitFor();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted while creating a junction", e);
+        }
+        if (exitCode != 0) {
+            throw new IOException("mklink /J failed with exit code " + exitCode + ": " + output.trim());
+        }
+        BasicFileAttributes attributes = Files.readAttributes(link, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        check(attributes.isOther(), "the planted entry is not a junction");
     }
 
     /** Something a test does at a chosen moment during a copy. */
@@ -793,6 +1182,10 @@ public class StorageClusterTest {
             body.run(tempDir);
             passed++;
             System.out.println("PASS  " + name);
+        } catch (SkipTest e) {
+            skipped++;
+            System.out.println("SKIP  " + name);
+            System.out.println("      " + e.getMessage());
         } catch (AssertionError e) {
             failed++;
             System.out.println("FAIL  " + name);
