@@ -45,11 +45,13 @@ import java.util.regex.Pattern;
  * example, its storage directory was deleted after the node started), they throw a plain
  * {@link IOException}. A broken node is never reported as one that simply lacks the chunk.
  *
- * <p><b>Deleting.</b> {@link #deleteChunk(String)} is stricter than the other methods: it reads
- * attributes without following links, and deletes a chunk only if the storage directory is a
- * plain directory (not a symbolic link or junction) and the chunk's entry is a regular file. If
- * either cannot be established, nothing is deleted and an IOException is thrown. Temp files and
- * other chunks are never touched.
+ * <p><b>Deleting and retrieving.</b> {@link #deleteChunk(String)} and
+ * {@link #retrieveChunk(String, Path)} are stricter than the other methods: they read attributes
+ * without following links, and delete or read a chunk only if the storage directory is a plain
+ * directory (not a symbolic link or junction) and the chunk's entry is a regular file. If either
+ * cannot be established, nothing is deleted or read and an IOException is thrown. Temp files and
+ * other chunks are never touched. (The check and the later open are two steps; as below, the
+ * node assumes no other program changes its directory in between.)
  *
  * <p><b>Assumptions and limits.</b>
  * <ul>
@@ -169,12 +171,15 @@ public class StorageNode {
      * @throws IllegalArgumentException if the chunk ID is invalid, if {@code destination} is the
      *         node's storage directory or anywhere inside it, or if {@code destination} is an
      *         existing directory (all checked before anything is created)
-     * @throws ChunkNotFoundException if this node's storage is available but holds no chunk with
-     *         this ID (nothing is created in that case)
+     * @throws ChunkNotFoundException if this node's storage is a plain directory with no entry
+     *         under this ID (nothing is created in that case)
      * @throws FileAlreadyExistsException if {@code destination} already exists
-     * @throws IOException if the node cannot tell whether it holds the chunk (for example, its
-     *         storage directory is gone), or if copying fails; a partial destination created by
-     *         this call is deleted first, but empty parent directories it created may remain
+     * @throws IOException if the node cannot tell whether it holds the chunk as a regular file:
+     *         its storage directory is missing or is not a plain directory, or the entry under this
+     *         ID is a directory, symbolic link, junction or other reparse point (read without
+     *         following links, so a link is never read through, even if its target exists); or if
+     *         copying fails, in which case a partial destination created by this call is deleted
+     *         first, but empty parent directories it created may remain
      */
     public long retrieveChunk(String chunkId, Path destination) throws IOException {
         Path chunkFile = chunkFileFor(chunkId);
@@ -183,7 +188,10 @@ public class StorageNode {
         if (Files.isDirectory(destination)) {
             throw new IllegalArgumentException("Destination is an existing directory: " + destination);
         }
-        if (!chunkExists(chunkFile)) {
+        // No-follow check, as for deleting: a link or junction under the chunk's name (or in place
+        // of the storage directory) is refused rather than read, so the node never serves data
+        // from outside its own directory.
+        if (!regularChunkFileExists(chunkFile)) {
             throw new ChunkNotFoundException(chunkId, storageDir);
         }
 
@@ -461,8 +469,9 @@ public class StorageNode {
     }
 
     /**
-     * The no-follow check used for deleting. Returns true if the entry is a regular file, and
-     * false only if the storage directory is a plain directory with no entry under this name.
+     * The no-follow check used for deleting and retrieving. Returns true if the entry is a regular
+     * file, and false only if the storage directory is a plain directory with no entry under this
+     * name.
      * Throws if the storage directory is missing or is not a plain directory, if the entry is
      * anything other than a regular file (a directory, symbolic link, junction or other reparse
      * point: Java reports all of these as not regular when links are not followed), or if the
@@ -480,7 +489,7 @@ public class StorageNode {
         }
         if (!attributes.isRegularFile()) {
             throw new IOException("Storage entry for this chunk is not a regular file (it may be a directory,"
-                    + " a link or a junction); nothing was deleted: " + chunkFile);
+                    + " a link or a junction), so it was left alone: " + chunkFile);
         }
         return true;
     }
@@ -494,7 +503,7 @@ public class StorageNode {
     private void requirePlainStorageDirectory() throws IOException {
         if (!DataDirectory.isPlainDirectory(storageDir)) {
             throw new IOException("Storage directory is missing or is not a plain directory (it may have been"
-                    + " deleted, or replaced by a file, link or junction); nothing was deleted: " + storageDir);
+                    + " deleted, or replaced by a file, link or junction), so it was left alone: " + storageDir);
         }
     }
 

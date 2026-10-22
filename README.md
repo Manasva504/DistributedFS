@@ -42,7 +42,7 @@ What it demonstrates:
 - **Chunking** (`FileChunker`): splits a file into 1 MiB chunk files named `chunk_0`, `chunk_1`, … and returns them in order.
 - **Reconstruction** (`FileReconstructor`): joins chunk files, in the order given, into a byte-identical copy of the original.
 - **Integrity checks** (`ChecksumService`): calculates SHA-256 checksums and verifies a file against an expected value.
-- **Simulated storage node** (`StorageNode`, `ChunkNotFoundException`): stores, retrieves and deletes chunks in its own local folder, with safe chunk IDs. A chunk's ID appears only after all of its bytes have been written successfully. Deleting never follows a symbolic link or junction.
+- **Simulated storage node** (`StorageNode`, `ChunkNotFoundException`): stores, retrieves and deletes chunks in its own local folder, with safe chunk IDs. A chunk's ID appears only after all of its bytes have been written successfully. Before retrieving or deleting a chunk, it checks without following links that its folder is a plain folder and the chunk is a regular file; see [Known limitations](#known-limitations) for what that check doesn't cover.
 - **Storage cluster** (`StorageCluster`): spreads chunks over several nodes round-robin, keeps each chunk ID on exactly one node, falls back to the next node when a store fails with an I/O error, and deletes a chunk only when every node answered and exactly one holds it.
 - **End-to-end demo** (`DistributedFsDemo`): runs the whole workflow from the command line and reports whether the rebuilt file's SHA-256 matches the original.
 - **HTTP server** (`DistributedFsServer`, `FileApiHandler`): serves `GET /health`, `POST /files` and `GET /files/<fileId>` on `127.0.0.1` only. See [HTTP API](#http-api).
@@ -51,7 +51,7 @@ What it demonstrates:
 - **Persistent metadata** (`ManifestStore`, `FileManifest`): one small text manifest per stored file, and a pending-upload marker for each upload in progress.
 - **Data directory** (`DataDirectory`): checks, initializes and locks the server's data folder, so only one server uses it at a time.
 - **Startup recovery** (`StartupRecovery`, `StaleTempFiles`): finishes or undoes interrupted uploads, removes stale temporary files and request workspaces, and reports chunks that nothing refers to, without deleting them.
-- **Tests:** 20 plain-Java test runners with 377 normal tests, plus 9 separate stress tests, which run with a 16 MiB heap when started with the documented `-Xmx16m` option.
+- **Tests:** 21 plain-Java test runners with 398 normal tests, plus 9 separate stress tests, which run with a 16 MiB heap when started with the documented `-Xmx16m` option.
 
 ## Architecture
 
@@ -171,12 +171,12 @@ The server's upload and download workflows are described in [Data directory, upl
 | `FileChunker` | Splits a file into 1 MiB chunk files and returns them in order. | Streams through one chunk-sized buffer. Never overwrites existing files (`CREATE_NEW`). If it fails with an I/O error reported by Java, it tries to delete the chunks it created. Also usable on its own from the command line. |
 | `FileReconstructor` | Joins chunk files, in list order, into one new file. | Streams through a 64 KiB buffer. An empty list produces an empty file. Refuses to overwrite the destination. If it fails with an I/O error reported by Java, it tries to delete the partial output it created. |
 | `ChecksumService` | Calculates SHA-256 and checks a file against an expected checksum. | Streams through a 64 KiB buffer. `matches()` returns `true` or `false` only when it could actually read the file; otherwise it throws. |
-| `StorageNode` | One simulated storage node that stores, retrieves and deletes chunks in its own local folder. | The chunk ID is the file name, and strict ID rules block path traversal. Writes each chunk to a temporary file and renames it to the chunk ID only after writing completes; the rename refuses to replace an existing chunk. Rejects retrieve destinations inside its own folder. A node that cannot check (for example, its folder was deleted) throws an `IOException` instead of reporting the chunk as absent. Deletes only a regular file in a plain folder, checked without following links. |
+| `StorageNode` | One simulated storage node that stores, retrieves and deletes chunks in its own local folder. | The chunk ID is the file name, and strict ID rules block path traversal. Writes each chunk to a temporary file and renames it to the chunk ID only after writing completes; the rename refuses to replace an existing chunk. Rejects retrieve destinations inside its own folder. A node that cannot check (for example, its folder was deleted) throws an `IOException` instead of reporting the chunk as absent. Before retrieving or deleting, checks without following links that its folder is a plain folder and the chunk is a regular file; storing and `hasChunk` don't make that check (see [Known limitations](#known-limitations)). |
 | `ChunkNotFoundException` | Reports that a chunk is definitely absent. | A subclass of `IOException` that carries the chunk ID. Thrown only when a node, or every node in a cluster, confirms the chunk is not there. |
 | `StorageCluster` | Coordinates several storage nodes behind one interface. | Round-robin placement, falling back to the next node after an I/O failure. Checks every node before storing so each chunk ID lives on one node, and refuses to store if any node cannot answer. Distinguishes missing chunks from unavailable nodes. Rejects retrieve destinations inside any node's folder. Deletes a chunk only if every node answered and exactly one holds it. |
 | `DistributedFsDemo` | Command-line program that runs the whole workflow and verifies the result. | Works in a new temp workspace and deletes it afterwards, without following links, unless `--keep` is given. Prints the original checksum once it has read the input, and the rebuilt file's checksum only if the run gets that far. Once the arguments are accepted, every outcome it handles prints one `RESULT: SUCCESS` or `RESULT: FAILURE` line; argument errors print usage instructions instead. |
 | `DistributedFsServer` | Command-line server: opens the data directory, runs startup recovery, and serves the HTTP API on `127.0.0.1`. | Nothing listens until every startup step has succeeded; a failed start undoes what it started and releases the data directory's lock. 4 worker threads and a queue of 64 requests. Stops on Ctrl+C. |
-| `FileApiHandler` | Handles every HTTP request. | Checks the `Host` header first, routes by exact raw path, enforces the upload size limit while reading, checks download file IDs before any decoding, disconnects downloads that stall, and sends fixed JSON error bodies. |
+| `FileApiHandler` | Handles every HTTP request. | Checks the `Host` header first, routes by exact raw path, enforces the upload size limit while reading, checks download file IDs before any decoding, disconnects clients that stall while sending a request body or receiving a download, and sends fixed JSON error bodies. |
 | `FileService` | Stores uploads and prepares downloads. | Upload: writes a pending marker, then the chunks, then the manifest (the commit point), and rolls back a failed upload, newest chunk first. Download: copies the chunks in order, rebuilds the file, and checks its size and SHA-256 against the manifest. |
 | `ManifestStore`, `FileManifest` | Manifests and pending-upload markers as small text files. | Written to a temporary file and renamed into place, never replaced. Read strictly: anything not exactly as written is reported as invalid. |
 | `DataDirectory` | The server's data folder. | Creates the layout in a new folder, refuses a non-empty folder it doesn't recognize, and holds an operating-system lock on `server.lock` while the server runs. |
@@ -226,12 +226,13 @@ Each suite is a plain-Java program. It prints `PASS`, `FAIL` or `SKIP` for every
 | `JsonTest` | 8 | none |
 | `ManifestStoreTest` | 23 | none |
 | `StaleTempFilesTest` | 4 | none |
+| `StalledRequestTest` | 16 | none |
 | `StallWatchTest` | 6 | none |
 | `StartupRecoveryTest` | 23 | none |
-| `StorageClusterTest` | 41 | 1 |
-| `StorageNodeTest` | 52 | 1 |
+| `StorageClusterTest` | 43 | 1 |
+| `StorageNodeTest` | 55 | 1 |
 | `UploadEndpointTest` | 23 | 2 |
-| **Total** | **377** | **9** |
+| **Total** | **398** | **9** |
 
 Run every suite from the repository folder:
 
@@ -239,7 +240,7 @@ Run every suite from the repository folder:
 foreach ($suite in 'ApiErrorTest', 'ChecksumServiceTest', 'CrashRecoveryTest', 'DataDirectoryTest',
         'DistributedFsDemoTest', 'DistributedFsServerTest', 'DownloadEndpointTest', 'FileChunkerTest',
         'FileIdsTest', 'FileReconstructorTest', 'FileServiceTest', 'FileTreesTest', 'JsonTest',
-        'ManifestStoreTest', 'StaleTempFilesTest', 'StallWatchTest', 'StartupRecoveryTest',
+        'ManifestStoreTest', 'StaleTempFilesTest', 'StalledRequestTest', 'StallWatchTest', 'StartupRecoveryTest',
         'StorageClusterTest', 'StorageNodeTest', 'UploadEndpointTest') {
     java -cp "out;out-test" "com.distributedfs.$suite"
 }
@@ -253,7 +254,7 @@ java -cp "out;out-test" com.distributedfs.UploadEndpointTest
 
 Some tests are reported as `SKIP` instead of passing when the machine can't run them:
 
-- Two tests, one in `StorageNodeTest` and one in `StorageClusterTest`, need to create a symbolic link. Windows allows that only with Developer Mode turned on or with administrator rights. On the Windows 11 machine where the current code was verified, both were skipped (see [Recorded verification results](#recorded-verification-results)). The same protection is also tested with Windows junctions, which don't need special rights, and those tests ran.
+- Four tests, two in `StorageNodeTest` and two in `StorageClusterTest`, need to create a symbolic link. Windows allows that only with Developer Mode turned on or with administrator rights. On the Windows 11 machine where the code was verified, they were skipped (see [Recorded verification results](#recorded-verification-results)). Related checks are also tested with Windows junctions, which don't need special rights, and those tests ran; they don't replace the symbolic-link tests (see [Known limitations](#known-limitations)).
 - One `DistributedFsServerTest` test needs an IPv4 address other than loopback, to show that the server can't be reached through it.
 
 `CrashRecoveryTest` and `DataDirectoryTest` start extra Java processes with the same class path, and several tests create Windows junctions with `cmd.exe /c mklink /J` inside their own temporary folders.
@@ -277,12 +278,21 @@ In PowerShell, keep the quotes around `"out;out-test"`: an unquoted `;` ends the
 
 ### Recorded verification results
 
-These are the results of one recorded verification run of the code in commit `0feb7a1` ("Add verified HTTP file downloads"), on Windows 11 with JDK 23.0.1, on 20 October 2026. They describe that run on that machine, not a guarantee for other environments.
+The results below were recorded when each run was made; they are not rerun when this README changes. They describe those runs on that machine, not a guarantee for other environments.
+
+The first recorded run tested the code in commit `0feb7a1` ("Add verified HTTP file downloads"), on Windows 11 with JDK 23.0.1, on 20 October 2026:
 
 - **Normal tests:** all 20 suites exited with code 0. Of the 377 normal tests, 375 passed, 0 failed and 2 were skipped. The two skipped tests are the symbolic-link tests described above; Developer Mode was off and the shell was not elevated.
 - **Stress tests,** run separately and not included in the figures above: all 9 passed with `-Xmx16m`, including the 100 MiB download.
 - **Deliberate-break checks:** 11 checks each broke one rule of the download code in a separate copy of the source (for example: skip the SHA-256 check, decode the file ID before checking it, read without the storage lock, accept `HEAD`, disable the stall watchdog, keep the download workspace). The tests detected all 11.
 - **Not verified:** stopping the server with Ctrl+C. The shutdown hook is covered only indirectly, by tests of the server's `stop()` method, and has not been checked by hand.
+
+A later recorded run tested the request-stall hardening (stalled request bodies and uploads, and the no-follow check before retrieving chunks) before it was committed, on the same machine with JDK 23.0.1, on 22 October 2026. Only this README has changed since that run; the Java source and tests are the ones that were tested.
+
+- **Normal tests:** all 21 suites exited with code 0. Of the 398 normal tests, 394 passed, 0 failed and 4 were skipped: the four symbolic-link tests, with Developer Mode off and the shell not elevated.
+- **Stress tests,** run separately: all 9 passed with `-Xmx16m`.
+- **Regression check:** the new tests were also run against the code from before the change. There, 13 of the 16 `StalledRequestTest` tests and all 3 new junction tests failed, as intended. The 3 `StalledRequestTest` tests that passed cover behavior that was already correct: complete bodies, a slow but steady upload, and the download route.
+- **Deliberate-break checks:** 6 checks each broke one new rule in a separate copy of the source (skip finishing the body before a response, ignore chunked bodies, treat every request as having no body, count no upload progress, let the upload watchdog never fire, follow links when retrieving). The tests detected all 6.
 
 ## Running the demo
 
@@ -425,7 +435,7 @@ Request rules:
 
 - **`Content-Type`**: exactly one, `application/octet-stream` (parameters after a `;` are allowed).
 - **`X-Content-SHA256`** (optional): exactly one, 64 hexadecimal characters in either case. If the uploaded data has a different SHA-256, the upload is refused and no file is committed to the storage cluster: nothing reaches the storage nodes or the manifest folder. (The body has already been written to the request's temporary workspace by then; that workspace is deleted afterwards, as for every upload.)
-- **Size limit**: 100 MiB unless `--max-upload-mb` says otherwise. A `Content-Length` over the limit is refused before any of the body is read, and a body sent without a length (chunked transfer encoding) is cut off with `413` as soon as it passes the limit.
+- **Size limit**: 100 MiB unless `--max-upload-mb` says otherwise. A `Content-Length` over the limit is refused with `413` after at most 64 KiB of the body has been read and discarded; the rest is never read. (Like every early answer, the refusal waits for that much of the declared body, under a fixed 30-second deadline: a client that sends no body at all, or not enough of it in time, gets no answer, and its connection is closed. See [Errors](#errors).) A body sent without a length (chunked transfer encoding) is cut off with `413` as soon as it passes the limit.
 - `Expect: 100-continue` is supported.
 
 A successful upload answers `201 Created`, with `Location: /files/<fileId>` and the new file's manifest as JSON:
@@ -454,7 +464,7 @@ Replace the placeholder with the `fileId` from the upload's response (or the las
 - **Methods:** only `GET`. Any other method on a path under `/files/`, including `HEAD`, gets `405` with `Allow: GET`.
 - **Uncommitted uploads are not files.** Only a file whose manifest has been written can be downloaded. An upload that never committed (a pending marker without a manifest) is `404 file_not_found`, like an ID that was never used.
 - **Damaged files** are reported, never served: an unreadable or invalid manifest is `500 metadata_corrupt`, a chunk that every storage node confirms is gone is `500 chunk_missing` (not `404`), and rebuilt content whose size or SHA-256 differs from the manifest is `500 integrity_check_failed`. A failed download never changes stored chunks, manifests or pending markers.
-- **Slow and stalled clients:** a watchdog closes the connection if a download makes no progress for 30 seconds. Progress counts only when a whole write of up to 64 KiB has been taken in, so a client must accept roughly 64 KiB every 30 seconds; a slower client is disconnected and receives an incomplete body. A `GET` should have no request body; if one declares a body (`Content-Length` or chunked), the body is read and discarded first, and if it does not arrive within the same 30 seconds the connection is closed without a response.
+- **Slow and stalled clients:** a watchdog closes the connection if a download makes no progress for 30 seconds. Progress counts only when a whole write of up to 64 KiB has been taken in, so a client must accept roughly 64 KiB every 30 seconds; a slower client is disconnected and receives an incomplete body. A `GET` should have no request body; if one declares a body (`Content-Length` or chunked), up to 64 KiB of it is read and discarded first, under a fixed 30-second deadline. If it doesn't arrive in time, or is malformed, the connection is closed without a response (see [Errors](#errors)).
 
 The whole file is rebuilt and checked before the first byte is sent, so large files take a moment to start, and each download needs temporary disk space (see [How a download is served](#how-a-download-is-served)).
 
@@ -485,7 +495,9 @@ The message is a fixed sentence: it never contains request input, exception text
 | 500 | `storage_error` | The data couldn't be stored or read. A failed upload was rolled back, or, if that couldn't be completed, left for startup recovery. |
 | 500 | `internal_error` | An unexpected error. |
 
-If an upload's client disconnects or sends an incomplete body, the server sends no response and the upload is not committed to the storage cluster: nothing reaches the storage nodes or the manifest folder, and the request's temporary workspace, which may already hold part of the body, is deleted. If a download's client disconnects, the download is abandoned and its workspace deleted. When all 4 worker threads are busy and 64 more requests are waiting, the server closes new connections without a response.
+A request that declares a body (a `Content-Length` other than 0, or chunked transfer encoding) but is answered without using it, such as an error answer or `GET /health`, first has up to 64 KiB of that body read and discarded. This has a fixed deadline of 30 seconds, counted from when the server starts discarding the body. Bytes that arrive don't extend it, so the first 64 KiB (or the whole body, if it is shorter) must arrive within that time. If it doesn't, if the body is malformed (for example, an invalid chunk), or if the client disconnects partway through it, the connection is closed without an HTTP response. If the body is longer than 64 KiB, the rest is never read, and the connection is closed after the answer.
+
+If an upload's client disconnects, sends an incomplete body, or sends nothing for 30 seconds, the server sends no response and the upload is not committed to the storage cluster: nothing reaches the storage nodes or the manifest folder, and the request's temporary workspace, which may already hold part of the body, is deleted. If a download's client disconnects, the download is abandoned and its workspace deleted. When all 4 worker threads are busy and 64 more requests are waiting, the server closes new connections without a response.
 
 ## Data directory, uploads, downloads and startup recovery
 
@@ -532,7 +544,7 @@ Both are written to a temporary file and renamed into place, never replaced, and
 
 ### How an upload is stored
 
-1. The body is copied into a new workspace in `tmp\`, enforcing the size limit while reading.
+1. The body is copied into a new workspace in `tmp\`, enforcing the size limit while reading. A watchdog abandons the upload if no data arrives for 30 seconds.
 2. Its SHA-256 is calculated and compared with `X-Content-SHA256`, if given. On a mismatch, the upload stops here: no file is committed, and nothing reaches the storage nodes or the manifest folder. The workspace, which already holds the body, is deleted as in every other case.
 3. The body is split into 1 MiB chunks inside the workspace.
 4. Holding the storage lock: the server picks an unused file ID, writes the pending marker, stores the chunks on the cluster, and writes the manifest. **Writing the manifest is the commit point:** before it, the file doesn't exist; after it, it does.
@@ -582,7 +594,10 @@ If recovery stops the start, the message lists each upload concerned and why, an
 - **Not production-ready.** This is a learning project. It has been built and tested on one Windows machine only, and it lacks the safeguards listed below.
 - **Upload and download only.** There is no endpoint to list files, read a file's metadata on its own, or delete a file over HTTP.
 - **No authentication, TLS or quotas.** The server only accepts connections from this machine (`127.0.0.1`) and requests addressed to `127.0.0.1` or `localhost`, but any program on this machine can upload and download files. Traffic is plain HTTP, and nothing limits how much a client stores in total; the only limit is the per-upload size.
-- **A request body that is declared but never sent can hold a worker thread.** Every response closes its request's unread body, which waits for that body to arrive. Downloads are protected: they finish the body first, under the 30-second watchdog. But for every other response (`/health`, error answers such as `400`, `404`, `405` and `415`, including errors on the download path), a client that declares a body and never sends it holds one of the 4 worker threads until it disconnects. There is also no general read timeout for request bodies, so a client that stalls while sending an upload body holds a worker the same way. Only the download path has watchdog protection today; fixing this for all requests is planned follow-up work (see the [roadmap](#roadmap)).
+- **A client that stops partway through its request headers can hold a worker thread.** The JDK's built-in HTTP server reads the request line and headers on a worker thread before this project's code runs, with no time limit by default, so the stall watchdog cannot reach that step. Four such connections would block all 4 worker threads until they disconnect.
+- **The stall watchdog covers three kinds of wait, and no others.** It closes the connection when a declared request body that the answer doesn't use (up to 64 KiB of it) has not arrived within 30 seconds, when an upload's body brings no new data for 30 seconds, and when a download's response makes no progress for 30 seconds. Other answers (`GET /health`, `201` after an upload, and every error answer) are small JSON bodies written without the watchdog. They normally fit in the connection's buffers, but a client that keeps sending requests on one connection without ever reading the answers can eventually fill those buffers and hold a worker thread until it disconnects. Stalled request headers (above) are not covered either.
+- **Early answers wait for up to 64 KiB of a declared body, under a fixed deadline.** An error answer such as `413` for a too-large `Content-Length`, or any other answer that doesn't use the body, is sent only after up to 64 KiB of the declared body has arrived. That must happen within 30 seconds in total: arriving bytes don't reset the deadline, so a client that sends those 64 KiB slower than roughly 2 KiB per second is disconnected. A client that declares a body and sends nothing, sends too little in time, sends a malformed body, or disconnects partway through gets no HTTP response; the connection is simply closed.
+- **Very slow uploads are not cut off.** The upload watchdog counts any bytes arriving as progress, so only a complete stop for 30 seconds is detected. A client that sends a few bytes every 29 seconds keeps a worker thread busy for as long as it keeps doing that.
 - **Slow downloads can be disconnected.** A client that takes in less than roughly 64 KiB in 30 seconds is cut off, even if it is still reading.
 - **Downloads start only after the whole file is checked.** The server rebuilds the file and checks its SHA-256 before sending the first byte, so the start is delayed for large files, and each download in progress needs temporary disk space of up to about twice the file's size. There is no check of free disk space.
 - **Recovery checks committed chunks only by name and type.** For a committed upload, startup recovery checks that each chunk exists as a regular file on exactly one node. It does not check the chunks' sizes or contents against the manifest.
@@ -595,8 +610,10 @@ If recovery stops the start, the message lists each upload concerned and why, an
 - **Temporary disk usage.** A demo run needs about four times the input file's size. While the server handles an upload, its workspace needs up to about twice the upload's size, in addition to the stored chunks.
 - **Interrupted demo runs can leave files behind.** If the demo is killed (for example with Ctrl+C or Task Manager) or the power fails, its workspace may remain. The demo prints its workspace path as soon as it creates it. (The server's startup recovery handles interrupted uploads in its data folder.)
 - **No durability guarantee.** Data is not forced to disk (no fsync), so recently written data may be lost if the power fails. Damaged manifests are then reported as invalid rather than read as wrong data. Behavior after a power loss has not been tested.
-- **Text-based path checks.** The checks that keep retrieved files out of node folders compare normalized paths and don't resolve symbolic links, junctions, or Windows short names. Deleting (chunk deletes, the temporary-file sweep, and workspace cleanup) never follows links or junctions. Reading a chunk does follow links; a linked chunk with the wrong content is still caught by a download's SHA-256 check.
-- **Symbolic-link tests were skipped where the code was verified.** The two tests that create symbolic links need Windows Developer Mode or administrator rights, and were skipped on the verification machine. The junction tests, which cover the same rule for junctions, ran and passed.
+- **Text-based path checks.** The checks that keep retrieved files out of node folders compare normalized paths and don't resolve symbolic links, junctions, or Windows short names. Deleting (chunk deletes, the temporary-file sweep, and workspace cleanup) never follows links or junctions.
+- **Link protection for chunk reads is a check, not a guarantee.** Before a chunk is retrieved, the node checks, without following links, that its own folder is a plain folder (not a link or junction) and that the chunk is a regular file, and refuses anything else. The check and the read are two separate steps, so a link that another program swaps in between them would still be followed. The folders above the node's folder are not checked, and a hard link looks like a regular file. Each node assumes that no other program changes its folder. A chunk with the wrong content is still caught by a download's SHA-256 check.
+- **Not every chunk operation makes that check.** `hasChunk`, which the cluster uses to find a chunk and to refuse duplicate stores, still follows links: through the cluster, a link under a chunk's name that points nowhere is reported as a missing chunk rather than refused (it is still not read). `storeChunk` also follows links, so it would write through a node folder that has been replaced by a link or junction, even though retrieving from such a folder is refused.
+- **Symbolic-link tests were skipped where the code was verified.** The four tests that create symbolic links need Windows Developer Mode or administrator rights, and were skipped on the verification machine. Two of them check that retrieving refuses a symbolic link to a file, which is the main case the retrieve check is for, so that case has not been tested on this machine. The junction tests ran and passed, including a junction under a chunk's name that points nowhere and a node folder replaced by a junction.
 - **Ctrl+C shutdown has not been checked by hand.**
 - **Tested only on Windows 11 with JDK 23.0.1.** Other operating systems and JDK versions are untested, and the commands in this README are written for PowerShell.
 
@@ -621,7 +638,7 @@ If recovery stops the start, the message lists each upload concerned and why, an
 
 Next, as follow-up work:
 
-- Stop a declared-but-unsent request body, or a stalled upload body, from holding a worker thread for every kind of request, not only downloads.
+- Stop a client that stalls partway through its request headers from holding a worker thread (this step runs inside the JDK's HTTP server, before the handler).
 - Check the symbolic-link tests on a machine with Developer Mode, and check Ctrl+C shutdown by hand.
 
 Possible later work (not decided, order not final):
@@ -663,14 +680,14 @@ DistributedFS/
 │   │   ├── StaleTempFiles.java           temporary-file sweep
 │   │   └── FileTrees.java                link-safe folder deletion
 │   └── test/java/com/distributedfs/      plain-Java test runners
-│       ├── 20 test runners (*Test.java)
+│       ├── 21 test runners (*Test.java)
 │       └── CrashUploadMain.java          helper program that CrashRecoveryTest kills mid-upload
 ├── .gitattributes                         LF line endings for text files
 ├── .gitignore                             ignores build output, logs, editor and OS files, demo workspaces
 └── README.md
 ```
 
-`out/` and `out-test/` are created by `javac`. `.gitignore` excludes them along with `*.class`, `*.log`, editor folders (`.idea/`, `.vscode/`), operating-system files (`Thumbs.db`, `desktop.ini`, `.DS_Store`), and demo workspaces (`distributedfs-demo-*/`). `ChunkNotFoundException`, `FileServiceException`, `InvalidManifestException`, `DataDirectoryException` and `UnsafeRecoveryException` have no test files of their own; the tests of the classes that throw them cover them. `FileApiHandler` and `DistributedFsServer` are tested by `DistributedFsServerTest`, `UploadEndpointTest` and `DownloadEndpointTest`; the download stall watchdog also has its own unit tests in `StallWatchTest`.
+`out/` and `out-test/` are created by `javac`. `.gitignore` excludes them along with `*.class`, `*.log`, editor folders (`.idea/`, `.vscode/`), operating-system files (`Thumbs.db`, `desktop.ini`, `.DS_Store`), and demo workspaces (`distributedfs-demo-*/`). `ChunkNotFoundException`, `FileServiceException`, `InvalidManifestException`, `DataDirectoryException` and `UnsafeRecoveryException` have no test files of their own; the tests of the classes that throw them cover them. `FileApiHandler` and `DistributedFsServer` are tested by `DistributedFsServerTest`, `UploadEndpointTest`, `DownloadEndpointTest` and `StalledRequestTest`; the stall watchdog also has its own unit tests in `StallWatchTest`.
 
 ## Running tests and contributing
 

@@ -34,12 +34,14 @@ import java.util.concurrent.atomic.AtomicInteger;
  * refused the same way.
  *
  * <p><b>Uploads</b> ({@code POST /files}). The body is the file's raw bytes. Before any of it is
- * read, the request must have exactly one {@code Content-Type: application/octet-stream} (415
+ * stored, the request must have exactly one {@code Content-Type: application/octet-stream} (415
  * otherwise), an optional {@code X-Content-SHA256} of exactly 64 hexadecimal characters (400
- * otherwise), and a {@code Content-Length}, if given, within the size limit (413 otherwise). The
- * body is then copied into a new workspace, stopping with 413 as soon as it passes the limit, and
- * handed to {@link FileService#store}. If the client disconnects or sends an incomplete body, no
- * response is sent at all. The workspace is always deleted afterwards.
+ * otherwise), and a {@code Content-Length}, if given, within the size limit (413 otherwise). Like
+ * every other early answer, such a refusal is sent after at most 64 KiB of the body has been read
+ * and discarded (see "Stalled clients" below). The body is otherwise copied into a new workspace,
+ * stopping with 413 as soon as it passes the limit, and handed to {@link FileService#store}. If
+ * the client disconnects, sends an incomplete body, or stops sending for the stall timeout, no
+ * response is sent at all and nothing is committed. The workspace is always deleted afterwards.
  *
  * <p><b>Downloads</b> ({@code GET /files/<fileId>}). Any path under {@code /files/} names a
  * file: any method but GET is 405 (HEAD included, as for every endpoint). The rest of the raw path,
@@ -51,22 +53,28 @@ import java.util.concurrent.atomic.AtomicInteger;
  * requests are not supported: a Range header is ignored and the whole file is sent with
  * {@code Accept-Ranges: none}. The workspace is always deleted afterwards.
  *
- * <p><b>Stalled downloads.</b> A client that stops reading would otherwise hold a worker thread
- * and the file's workspace forever, so a watchdog ({@link StallWatch}) closes the connection when
- * a download makes no progress for {@link #DOWNLOAD_STALL_TIMEOUT_MILLIS}. Progress is counted
- * only when a whole write of up to 64 KiB has been accepted by the connection; a client that
- * does not take in that much within the timeout is disconnected, even if it is still reading
- * slowly. The watchdog covers two phases, each with its own timeout:
+ * <p><b>Stalled clients.</b> A worker thread that waits for a client which never sends or never
+ * reads is lost to every other request, and the server has only a few. So every wait on the
+ * client runs under a watchdog ({@link StallWatch}) that closes the connection when it makes no
+ * progress for {@link #STALL_TIMEOUT_MILLIS}:
  * <ol>
- *   <li>The request body. A GET normally has none, but one that declares a body is read and
- *       discarded (at most 64 KiB, by the JDK) before anything else happens, so no download
- *       workspace exists while the server waits for it. This matters because closing an exchange
- *       drains an unread request body with a blocking read: a body that is declared but never
- *       sent would otherwise block the watchdog's own close later, and the worker with it.</li>
- *   <li>The response, from its headers to its last byte.</li>
+ *   <li><b>A declared request body that is not otherwise read.</b> Closing a response makes the
+ *       JDK drain any unread request body (at most 64 KiB) with a blocking read, so a body that is
+ *       declared but never sent would hold the worker. Before any response is sent, and before a
+ *       download creates anything, that body is therefore read and discarded under the watchdog
+ *       ({@link #finishRequestBody}). If it does not arrive in time, the connection is closed
+ *       without a response. A request that declares no body (the normal GET) skips this step.</li>
+ *   <li><b>An upload's body.</b> Progress is any bytes arriving, so a slow upload is never cut off
+ *       while data keeps coming; one that stops for the timeout is abandoned.</li>
+ *   <li><b>A download's response</b>, from its headers to its last byte. Progress is counted only
+ *       when a whole write of up to 64 KiB has been accepted by the connection; a client that
+ *       does not take in that much within the timeout is disconnected, even if it is still
+ *       reading slowly.</li>
  * </ol>
- * The watchdog is one daemon thread per download phase in progress, so there are never more of
- * them than worker threads.
+ * Before the handler runs, the JDK reads the request line and headers on the worker thread
+ * itself; no watchdog here can reach that phase, so a client that stops in the middle of its
+ * headers can still hold a worker. The watchdog is one daemon thread per guarded phase in
+ * progress, so there are never more of them than worker threads.
  *
  * <p><b>Errors.</b> Error bodies are exactly {@link ApiError#toJson()}: fixed text that never
  * contains exception messages, request input or file system paths. If handling a request fails
@@ -83,36 +91,37 @@ class FileApiHandler implements HttpHandler {
     private static final int BUFFER_SIZE = 64 * 1024;
 
     /**
-     * How long a download may go without progress before the connection is closed: 30 seconds,
-     * the same as the JDK server's own default for idle connections. While the response is sent,
-     * progress is a completed write of up to 64 KiB, so a client must take in roughly 64 KiB
-     * every 30 seconds (less only if the connection's buffers have room); a slower client is
-     * disconnected. A declared request body must arrive within the same time.
+     * How long a wait on the client may go without progress before the connection is closed:
+     * 30 seconds, the same as the JDK server's own default for idle connections. It applies to a
+     * declared request body that must be discarded (which must arrive within this time), to an
+     * upload's body (some bytes must arrive at least this often), and to a download's response
+     * (each write of up to 64 KiB must be accepted within this time, so a client must take in
+     * roughly 64 KiB every 30 seconds, less only if the connection's buffers have room).
      */
-    static final long DOWNLOAD_STALL_TIMEOUT_MILLIS = 30_000;
+    static final long STALL_TIMEOUT_MILLIS = 30_000;
 
     /** The port the server actually listens on; the Host header must name exactly this port. */
     private final int port;
     private final PrintStream err;
     private final FileService files;
-    private final long downloadStallTimeoutMillis;
+    private final long stallTimeoutMillis;
 
     FileApiHandler(int port, PrintStream err, FileService files) {
-        this(port, err, files, DOWNLOAD_STALL_TIMEOUT_MILLIS);
+        this(port, err, files, STALL_TIMEOUT_MILLIS);
     }
 
     /** As above, with another stall timeout; tests use a short one. */
-    FileApiHandler(int port, PrintStream err, FileService files, long downloadStallTimeoutMillis) {
+    FileApiHandler(int port, PrintStream err, FileService files, long stallTimeoutMillis) {
         if (port < 1 || port > 65535) {
             throw new IllegalArgumentException("port must be 1 to 65535, but was " + port);
         }
-        if (downloadStallTimeoutMillis < 1) {
-            throw new IllegalArgumentException("downloadStallTimeoutMillis must be at least 1");
+        if (stallTimeoutMillis < 1) {
+            throw new IllegalArgumentException("stallTimeoutMillis must be at least 1");
         }
         this.port = port;
         this.err = Objects.requireNonNull(err, "err must not be null");
         this.files = Objects.requireNonNull(files, "files must not be null");
-        this.downloadStallTimeoutMillis = downloadStallTimeoutMillis;
+        this.stallTimeoutMillis = stallTimeoutMillis;
     }
 
     @Override
@@ -248,17 +257,33 @@ class FileApiHandler implements HttpHandler {
         try {
             Path body = workspace.resolve("body");
             boolean withinLimit;
-            try {
-                withinLimit = spool(exchange.getRequestBody(), body, files.maxUploadBytes());
-            } catch (ClientGoneException e) {
-                // The request is incomplete, so no response is sent; closing the exchange ends it.
-                err.println("Upload abandoned: the client disconnected or sent an incomplete body ("
-                        + e.getCause() + ")");
-                return;
-            } catch (IOException e) {
-                err.println("Error: could not write the upload to its workspace: " + e);
-                sendError(exchange, ApiError.STORAGE_ERROR, null);
-                return;
+            // The body is read under the stall watchdog, with progress whenever bytes arrive. If
+            // none arrive for the stall timeout, the watchdog closes the connection (no response
+            // has started, so the JDK closes it directly), the blocked read fails, and the upload
+            // is abandoned like any incomplete one: nothing has been stored. The watch is released
+            // before anything is hashed or stored, so slow work on the server never trips it.
+            try (StallWatch watch = new StallWatch(exchange, stallTimeoutMillis)) {
+                try {
+                    withinLimit = spool(exchange.getRequestBody(), body, files.maxUploadBytes(), watch::progress);
+                } catch (ClientGoneException e) {
+                    // The request is incomplete, so no response is sent; closing the exchange ends it.
+                    err.println("Upload abandoned: " + (watch.fired()
+                            ? "no data arrived for " + stallTimeoutMillis + " ms"
+                            : "the client disconnected or sent an incomplete body") + " (" + e.getCause() + ")");
+                    return;
+                } catch (IOException e) {
+                    if (!watch.release()) {
+                        err.println("Upload abandoned: no data arrived for " + stallTimeoutMillis + " ms");
+                        return;
+                    }
+                    err.println("Error: could not write the upload to its workspace: " + e);
+                    sendError(exchange, ApiError.STORAGE_ERROR, null);
+                    return;
+                }
+                if (!watch.release()) {
+                    err.println("Upload abandoned: no data arrived for " + stallTimeoutMillis + " ms");
+                    return;
+                }
             }
             if (!withinLimit) {
                 sendError(exchange, ApiError.PAYLOAD_TOO_LARGE, null);
@@ -299,12 +324,14 @@ class FileApiHandler implements HttpHandler {
 
     /**
      * Copies the request body into the new file {@code body}. Returns false, without reading
-     * further, as soon as more than {@code maxBytes} have arrived.
+     * further, as soon as more than {@code maxBytes} have arrived. Runs {@code progress} each time
+     * bytes arrive, which keeps the caller's stall watchdog from firing.
      *
-     * @throws ClientGoneException if reading the request fails
+     * @throws ClientGoneException if reading the request fails (including when the watchdog has
+     *         closed the connection)
      * @throws IOException if writing the file fails
      */
-    private static boolean spool(InputStream in, Path body, long maxBytes) throws IOException {
+    private static boolean spool(InputStream in, Path body, long maxBytes, Runnable progress) throws IOException {
         byte[] buffer = new byte[BUFFER_SIZE];
         long total = 0;
         try (OutputStream out = Files.newOutputStream(body, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
@@ -318,6 +345,7 @@ class FileApiHandler implements HttpHandler {
                 if (read == -1) {
                     return true;
                 }
+                progress.run();
                 total += read;
                 if (total > maxBytes) {
                     return false;
@@ -376,7 +404,7 @@ class FileApiHandler implements HttpHandler {
 
     /** {@code fileId} has been checked with {@link FileIds#isValid}, so it is safe to log. */
     private void handleDownload(HttpExchange exchange, String fileId) throws IOException {
-        if (!finishRequestBody(exchange, fileId)) {
+        if (!finishRequestBody(exchange, "Download of file " + fileId)) {
             return; // the connection was closed; nothing was created and no response can be sent
         }
         Path workspace;
@@ -406,32 +434,65 @@ class FileApiHandler implements HttpHandler {
     }
 
     /**
-     * Reads and discards the request body, if any, before anything is created (see the class
-     * comment). Closing the JDK's request-body stream drains at most 64 KiB with a blocking read,
-     * so this runs under a watchdog. If the body does not arrive in time, the watchdog closes the
-     * exchange; because no response has started, the JDK then closes the connection directly
-     * without reading the body, which makes the blocked read here fail at once.
+     * Reads and discards the request body, if the request declares one, so that closing the
+     * response later cannot block on it (see the class comment). Closing the JDK's request-body
+     * stream drains at most 64 KiB with a blocking read, so this runs under a watchdog. If the
+     * body does not arrive in time, the watchdog closes the exchange; because no response has
+     * started, the JDK then closes the connection directly without reading the body, which makes
+     * the blocked read here fail at once. Calling this again after it succeeded is harmless.
      *
-     * @return true to go on; false if the body never completed and the connection is closed
+     * @param what how a log line names this request, for example "Download of file (id)"
+     * @return true to go on; false if the body never completed and the connection is closed, in
+     *         which case no response can be sent
      */
-    private boolean finishRequestBody(HttpExchange exchange, String fileId) {
-        try (StallWatch watch = new StallWatch(exchange, downloadStallTimeoutMillis)) {
+    private boolean finishRequestBody(HttpExchange exchange, String what) {
+        if (!declaresBody(exchange.getRequestHeaders())) {
+            return true; // the JDK's body stream is already at its end; closing it cannot block
+        }
+        try (StallWatch watch = new StallWatch(exchange, stallTimeoutMillis)) {
             try {
                 exchange.getRequestBody().close();
             } catch (IOException e) {
-                err.println("Download of file " + fileId + " abandoned: "
+                err.println(what + " abandoned: "
                         + (watch.fired() ? "its declared request body did not arrive within "
-                                + downloadStallTimeoutMillis + " ms" : "its request body could not be read")
+                                + stallTimeoutMillis + " ms" : "its request body could not be read")
                         + " (" + e + ")");
                 return false;
             }
             if (!watch.release()) {
-                err.println("Download of file " + fileId + " abandoned: its declared request body did not arrive"
-                        + " within " + downloadStallTimeoutMillis + " ms");
+                err.println(what + " abandoned: its declared request body did not arrive within "
+                        + stallTimeoutMillis + " ms");
                 return false;
             }
             return true;
         }
+    }
+
+    /**
+     * True if the request says a body follows: any Transfer-Encoding, or a Content-Length other
+     * than 0. (The JDK has already refused malformed or conflicting lengths.) Without either, the
+     * JDK treats the body as empty.
+     */
+    private static boolean declaresBody(Headers headers) {
+        if (headers.containsKey("Transfer-Encoding")) {
+            return true;
+        }
+        String length = headers.getFirst("Content-Length");
+        return length != null && !length.trim().equals("0");
+    }
+
+    /**
+     * The request's method and raw path for a log line, at most 100 characters, with anything
+     * that is not printable ASCII replaced by "?", so a client cannot forge console lines.
+     */
+    private static String describeRequest(HttpExchange exchange) {
+        String raw = exchange.getRequestMethod() + " " + exchange.getRequestURI().getRawPath();
+        StringBuilder safe = new StringBuilder();
+        for (int i = 0; i < raw.length() && safe.length() < 100; i++) {
+            char c = raw.charAt(i);
+            safe.append(c >= 0x20 && c < 0x7F ? c : '?');
+        }
+        return safe.toString();
     }
 
     /**
@@ -455,7 +516,7 @@ class FileApiHandler implements HttpHandler {
         headers.set("Content-Type", OCTET_STREAM);
         headers.set("X-Content-Type-Options", "nosniff");
         headers.set("Accept-Ranges", "none");
-        try (StallWatch watch = new StallWatch(exchange, downloadStallTimeoutMillis)) {
+        try (StallWatch watch = new StallWatch(exchange, stallTimeoutMillis)) {
             try {
                 // -1: no body (0 would mean "chunked"); otherwise exactly the verified size.
                 exchange.sendResponseHeaders(200, size == 0 ? -1 : size);
@@ -485,7 +546,7 @@ class FileApiHandler implements HttpHandler {
                 out.close();
             } catch (IOException e) {
                 err.println("Download of file " + fileId + " abandoned: "
-                        + (watch.fired() ? "the client accepted no data for " + downloadStallTimeoutMillis + " ms"
+                        + (watch.fired() ? "the client accepted no data for " + stallTimeoutMillis + " ms"
                                 : "the client disconnected or the response could not be written")
                         + " (" + e + ")");
             }
@@ -519,7 +580,7 @@ class FileApiHandler implements HttpHandler {
             this.exchange = exchange;
             this.timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
             long checkMillis = Math.max(10, Math.min(1000, timeoutMillis / 4));
-            this.thread = new Thread(() -> watch(checkMillis), "distributedfs-download-watch");
+            this.thread = new Thread(() -> watch(checkMillis), "distributedfs-stall-watch");
             thread.setDaemon(true);
             thread.start();
         }
@@ -590,18 +651,24 @@ class FileApiHandler implements HttpHandler {
     // ---------------------------------------------------------------------
 
     /** Sends an error response; {@code allow} is the Allow header for 405, otherwise null. */
-    private static void sendError(HttpExchange exchange, ApiError error, String allow) throws IOException {
+    private void sendError(HttpExchange exchange, ApiError error, String allow) throws IOException {
         Headers headers = exchange.getResponseHeaders();
         if (allow != null) {
             headers.set("Allow", allow);
         }
-        // Any request body was not read, so the connection is not reused.
+        // A request body may not have been read in full, so the connection is not reused.
         headers.set("Connection", "close");
         sendJson(exchange, error.status(), error.toJson());
     }
 
     /** Sends a JSON body. HEAD requests get the status and headers only, as HTTP requires. */
-    private static void sendJson(HttpExchange exchange, int status, String json) throws IOException {
+    private void sendJson(HttpExchange exchange, int status, String json) throws IOException {
+        // Every response except a download's goes through here. Closing it would drain an unread
+        // request body with a blocking read, so a declared body is finished first, under the stall
+        // watchdog. If it never arrives, the connection is already closed and nothing can be sent.
+        if (!finishRequestBody(exchange, "Request " + describeRequest(exchange))) {
+            return;
+        }
         byte[] body = json.getBytes(StandardCharsets.US_ASCII);
         Headers headers = exchange.getResponseHeaders();
         headers.set("Content-Type", "application/json; charset=utf-8");
