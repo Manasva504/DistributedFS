@@ -59,7 +59,7 @@ public class DownloadEndpointTest {
     private static final int MIB = 1024 * 1024;
     private static final InetAddress LOOPBACK = loopback();
     private static final String OCTET = "Content-Type: application/octet-stream\r\n";
-    private static final String WATCH_THREAD = "distributedfs-download-watch";
+    private static final String WATCH_THREAD = "distributedfs-stall-watch";
 
     private static int passed = 0;
     private static int failed = 0;
@@ -488,7 +488,7 @@ public class DownloadEndpointTest {
 
     private static void clientDisconnects(Path tempDir) throws Exception {
         ByteArrayOutputStream errBytes = new ByteArrayOutputStream();
-        withServer(tempDir, 1, MIB, FileApiHandler.DOWNLOAD_STALL_TIMEOUT_MILLIS, errBytes, server -> {
+        withServer(tempDir, 1, MIB, FileApiHandler.STALL_TIMEOUT_MILLIS, errBytes, server -> {
             byte[] data = bytes(32 * MIB, 1);
             String id = upload(server, data);
             try (Socket socket = smallBufferSocket(server)) {
@@ -740,7 +740,7 @@ public class DownloadEndpointTest {
     // ---------------------------------------------------------------------
 
     private static void stressLargeDownload(Path tempDir) throws Exception {
-        withServer(tempDir, 1, FileChunker.DEFAULT_CHUNK_SIZE, FileApiHandler.DOWNLOAD_STALL_TIMEOUT_MILLIS,
+        withServer(tempDir, 1, FileChunker.DEFAULT_CHUNK_SIZE, FileApiHandler.STALL_TIMEOUT_MILLIS,
                 new ByteArrayOutputStream(), 100L * MIB, server -> {
             Path file = tempDir.resolve("big");
             String expectedSha = writeLargeFile(file, 100L * MIB, 7);
@@ -802,7 +802,7 @@ public class DownloadEndpointTest {
 
     /** A server with 4 threads, 1 MiB upload limit and the given chunk size. */
     private static void withServer(Path tempDir, int chunkSize, ServerBody body) throws Exception {
-        withServer(tempDir, 4, chunkSize, FileApiHandler.DOWNLOAD_STALL_TIMEOUT_MILLIS, new ByteArrayOutputStream(),
+        withServer(tempDir, 4, chunkSize, FileApiHandler.STALL_TIMEOUT_MILLIS, new ByteArrayOutputStream(),
                 MIB, body);
     }
 
@@ -886,7 +886,7 @@ public class DownloadEndpointTest {
 
     /** Every stall watchdog has ended (each ends with its download). */
     private static void checkNoWatchThreads() throws Exception {
-        waitUntil(() -> liveThreads(WATCH_THREAD) == 0, 5, "no download watchdog threads are left");
+        waitUntil(() -> liveThreads(WATCH_THREAD) == 0, 5, "no stall watchdog threads are left");
     }
 
     private static long liveThreads(String name) {

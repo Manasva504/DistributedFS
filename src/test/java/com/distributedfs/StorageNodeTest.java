@@ -158,6 +158,14 @@ public class StorageNodeTest {
         runTest("deleteChunk refuses a symbolic link to a regular file and leaves the link and its target untouched",
                 StorageNodeTest::deleteRefusesFileSymlinkEntry);
 
+        // Retrieving without following links
+        runTest("retrieveChunk refuses a dangling junction under the chunk's ID instead of calling the chunk missing",
+                StorageNodeTest::retrieveRefusesDanglingJunctionEntry);
+        runTest("retrieveChunk refuses a junction in place of the storage directory and reads nothing behind it",
+                StorageNodeTest::retrieveRefusesJunctionedStorageDir);
+        runTest("retrieveChunk refuses a symbolic link to a regular file and copies nothing",
+                StorageNodeTest::retrieveRefusesFileSymlinkEntry);
+
         // Listing and stale temp files (used by startup recovery)
         runTest("listEntryNames lists every entry, sorted, and refuses a missing or junctioned storage directory",
                 StorageNodeTest::listEntryNamesListsEverything);
@@ -813,6 +821,77 @@ public class StorageNodeTest {
         IOException e = expectThrows(IOException.class, "deleteChunk", () -> node.deleteChunk("chunk_0"));
         checkContains(e.getMessage(), "not a regular file");
         expectThrows(IOException.class, "holdsRegularChunkFile", () -> node.holdsRegularChunkFile("chunk_0"));
+
+        check(Files.isSymbolicLink(link), "the link is left in place");
+        checkEquals(target, Files.readSymbolicLink(link), "the link still points at its target");
+        checkBytes(targetData, target);
+    }
+
+    /**
+     * A junction whose target is gone: following it finds nothing, which a link-following check
+     * would report as "chunk missing". The no-follow check sees an entry that is not a regular
+     * file, so the node says it cannot tell.
+     */
+    private static void retrieveRefusesDanglingJunctionEntry(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir);
+        Path gone = Files.createDirectory(tempDir.resolve("gone"));
+        Path entry = nodeDir.resolve("chunk_0");
+        createDirectoryJunction(entry, gone);
+        Files.delete(gone); // the junction now points at nothing
+        Path destination = tempDir.resolve("retrieved.bin");
+        try {
+            IOException e = expectThrows(IOException.class, () -> node.retrieveChunk("chunk_0", destination));
+            check(!(e instanceof ChunkNotFoundException), "a dangling junction must not be reported as a missing chunk");
+            checkContains(e.getMessage(), "not a regular file");
+            check(!Files.exists(destination, LinkOption.NOFOLLOW_LINKS), "no destination should be created");
+            check(Files.exists(entry, LinkOption.NOFOLLOW_LINKS), "the junction is left in place");
+        } finally {
+            Files.deleteIfExists(entry); // removes the junction itself
+        }
+    }
+
+    private static void retrieveRefusesJunctionedStorageDir(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir);
+        // Behind the junction: a regular file with the chunk's name, which must not be read.
+        Path outside = Files.createDirectory(tempDir.resolve("outside"));
+        byte[] outsideData = randomBytes(64, 7);
+        Files.write(outside.resolve("chunk_0"), outsideData);
+        Files.delete(nodeDir);
+        createDirectoryJunction(nodeDir, outside);
+        Path destination = tempDir.resolve("retrieved.bin");
+        try {
+            IOException e = expectThrows(IOException.class, () -> node.retrieveChunk("chunk_0", destination));
+            check(!(e instanceof ChunkNotFoundException), "a junctioned storage directory is not a missing chunk");
+            checkContains(e.getMessage(), "not a plain directory");
+            check(!Files.exists(destination, LinkOption.NOFOLLOW_LINKS), "nothing behind the junction is copied");
+
+            check(Files.exists(nodeDir, LinkOption.NOFOLLOW_LINKS), "the junction is left in place");
+            checkEquals(List.of("chunk_0"), listNames(outside), "files behind the junction");
+            checkBytes(outsideData, outside.resolve("chunk_0"));
+        } finally {
+            Files.deleteIfExists(nodeDir); // removes the junction itself, never its target
+        }
+    }
+
+    /**
+     * Skipped, not passed, where this account may not create symbolic links. A link-following
+     * check sees a regular file here and would copy the target's bytes out as the chunk.
+     */
+    private static void retrieveRefusesFileSymlinkEntry(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir);
+        byte[] targetData = randomBytes(64, 7);
+        Path target = Files.write(tempDir.resolve("target.bin"), targetData);
+        Path link = nodeDir.resolve("chunk_0");
+        createFileSymlinkOrSkip(link, target);
+        Path destination = tempDir.resolve("retrieved.bin");
+
+        IOException e = expectThrows(IOException.class, () -> node.retrieveChunk("chunk_0", destination));
+        check(!(e instanceof ChunkNotFoundException), "a link must not be reported as a missing chunk");
+        checkContains(e.getMessage(), "not a regular file");
+        check(!Files.exists(destination, LinkOption.NOFOLLOW_LINKS), "no destination should be created");
 
         check(Files.isSymbolicLink(link), "the link is left in place");
         checkEquals(target, Files.readSymbolicLink(link), "the link still points at its target");

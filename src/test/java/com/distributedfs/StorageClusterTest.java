@@ -140,6 +140,12 @@ public class StorageClusterTest {
         runTest("a symbolic link to a regular file under the chunk's ID blocks deletion and is left untouched",
                 StorageClusterTest::deleteRefusesFileSymlinkEntry);
 
+        // Retrieving without following links
+        runTest("a node whose storage folder became a junction refuses to retrieve and nothing behind it is copied",
+                StorageClusterTest::retrieveRefusesJunctionedStorageDir);
+        runTest("a symbolic link to a regular file under the chunk's ID is refused, not retrieved",
+                StorageClusterTest::retrieveRefusesFileSymlinkEntry);
+
         // Integration
         runTest("FileChunker -> StorageCluster -> FileReconstructor, checked with ChecksumService",
                 StorageClusterTest::endToEnd);
@@ -970,6 +976,48 @@ public class StorageClusterTest {
         checkEquals(List.of(0, 0, 0), nodes.stream().map(node -> node.deletes).toList(), "deletes per node");
         check(Files.isSymbolicLink(link), "the link is left in place");
         checkEquals(target, Files.readSymbolicLink(link), "the link still points at its target");
+        checkBytes(targetData, target);
+    }
+
+    /**
+     * The link-following hasChunk finds the file behind the junction, so the cluster picks node 1;
+     * the node's own no-follow check must then refuse to read through the junction.
+     */
+    private static void retrieveRefusesJunctionedStorageDir(Path tempDir) throws IOException {
+        StorageCluster cluster = new StorageCluster(createNodes(tempDir, 3));
+        Path outside = Files.createDirectory(tempDir.resolve("outside"));
+        byte[] outsideData = randomBytes(64, 7);
+        Files.write(outside.resolve("chunk_1"), outsideData);
+        Files.delete(nodeDir(tempDir, 1));
+        createDirectoryJunction(nodeDir(tempDir, 1), outside);
+        Path destination = tempDir.resolve("retrieved.bin");
+        try {
+            IOException e = expectThrows(IOException.class, () -> cluster.retrieveChunk("chunk_1", destination));
+            check(!(e instanceof ChunkNotFoundException), "a junctioned node folder is not a missing chunk");
+            checkContains(e.getMessage(), "not a plain directory");
+            check(!Files.exists(destination, LinkOption.NOFOLLOW_LINKS), "nothing behind the junction is copied");
+            check(Files.exists(nodeDir(tempDir, 1), LinkOption.NOFOLLOW_LINKS), "the junction is left in place");
+            checkEquals(List.of("chunk_1"), listNames(outside), "files behind the junction");
+            checkBytes(outsideData, outside.resolve("chunk_1"));
+        } finally {
+            Files.deleteIfExists(nodeDir(tempDir, 1)); // removes the junction itself, never its target
+        }
+    }
+
+    /** Skipped, not passed, where this account may not create symbolic links. */
+    private static void retrieveRefusesFileSymlinkEntry(Path tempDir) throws IOException {
+        StorageCluster cluster = new StorageCluster(createNodes(tempDir, 3));
+        byte[] targetData = randomBytes(64, 7);
+        Path target = Files.write(tempDir.resolve("target.bin"), targetData);
+        Path link = nodeDir(tempDir, 1).resolve("chunk_0");
+        createFileSymlinkOrSkip(link, target);
+        Path destination = tempDir.resolve("retrieved.bin");
+
+        IOException e = expectThrows(IOException.class, () -> cluster.retrieveChunk("chunk_0", destination));
+        check(!(e instanceof ChunkNotFoundException), "a link is not a missing chunk");
+        checkContains(e.getMessage(), "not a regular file");
+        check(!Files.exists(destination, LinkOption.NOFOLLOW_LINKS), "no destination should be created");
+        check(Files.isSymbolicLink(link), "the link is left in place");
         checkBytes(targetData, target);
     }
 

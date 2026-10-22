@@ -96,8 +96,8 @@ public class UploadEndpointTest {
         runTest("only exactly one application/octet-stream Content-Type is accepted", UploadEndpointTest::contentTypes);
         runTest("the size limit is enforced from Content-Length and while reading a chunked body",
                 UploadEndpointTest::sizeLimit);
-        runTest("a Content-Length over 100 MiB is refused before any of the body is read",
-                UploadEndpointTest::contentLengthRefusedBeforeReading);
+        runTest("a Content-Length over 100 MiB is refused after at most 64 KiB of the body is read",
+                UploadEndpointTest::contentLengthRefusedEarly);
 
         // Disconnects
         runTest("a fixed-length body cut off halfway gets no response and leaves nothing behind",
@@ -332,15 +332,34 @@ public class UploadEndpointTest {
         });
     }
 
-    private static void contentLengthRefusedBeforeReading(Path tempDir) throws Exception {
+    private static void contentLengthRefusedEarly(Path tempDir) throws Exception {
         withServer(tempDir, 100L * MIB, FileChunker.DEFAULT_CHUNK_SIZE, server -> {
-            // Only the headers are sent: the answer must come without waiting for any body.
+            // The headers and the first 64 KiB of the body are sent, then nothing more: the answer
+            // must come without waiting for the remaining 100 MiB. (The server reads and discards
+            // at most 64 KiB before answering, so a client that waits forever on its own headers
+            // never gets stuck; StalledRequestTest covers a client that sends no body at all.)
             try (Socket socket = connect(server)) {
-                socket.getOutputStream().write(head("POST", "/files", server, OCTET + "Content-Length: "
+                OutputStream out = socket.getOutputStream();
+                out.write(head("POST", "/files", server, OCTET + "Content-Length: "
                         + (100L * MIB + 1) + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
-                socket.getOutputStream().flush();
+                out.write(bytes(64 * 1024, 1));
+                out.flush();
                 RawResponse response = readOneResponse(socket.getInputStream());
-                checkErrorResponse(response, ApiError.PAYLOAD_TOO_LARGE, server, "header only");
+                checkErrorResponse(response, ApiError.PAYLOAD_TOO_LARGE, server, "64 KiB of a 100 MiB + 1 body");
+            }
+            // The same with Expect: 100-continue, as curl sends for large bodies: the server says
+            // "continue" first, then refuses after the first 64 KiB.
+            try (Socket socket = connect(server)) {
+                OutputStream out = socket.getOutputStream();
+                out.write(head("POST", "/files", server, OCTET + "Expect: 100-continue\r\nContent-Length: "
+                        + (100L * MIB + 1) + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
+                out.flush();
+                RawResponse interim = readOneResponse(socket.getInputStream());
+                checkEquals(100, interim.status(), "the interim response to Expect: 100-continue");
+                out.write(bytes(64 * 1024, 2));
+                out.flush();
+                RawResponse response = readOneResponse(socket.getInputStream());
+                checkErrorResponse(response, ApiError.PAYLOAD_TOO_LARGE, server, "with Expect: 100-continue");
             }
             checkNothingStored(server);
         });
