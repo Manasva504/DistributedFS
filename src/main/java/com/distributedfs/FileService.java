@@ -26,7 +26,8 @@ import java.util.Optional;
  * <ol>
  *   <li>Hash the spooled body; if the client sent a checksum and it differs, stop. Nothing has
  *       been stored.</li>
- *   <li>Split the body into chunks inside the workspace.</li>
+ *   <li>Split the body into chunks inside the workspace, and hash every chunk. An upload that
+ *       would need more chunks than a manifest may list is refused first; nothing is stored.</li>
  *   <li>Holding the lock: pick an unused file ID, write its pending-upload marker, store the
  *       chunks {@code <fileId>_0, _1, ...}, and write the manifest. <b>Writing the manifest is
  *       the commit point</b>: before it, the file does not exist; after it, it does.</li>
@@ -49,8 +50,10 @@ import java.util.Optional;
  *       committed file whose marker could not be deleted (served). Because uploads write the
  *       manifest last and roll back only uploads without one, all under the same lock, a
  *       download never sees a half-stored or half-rolled-back file.</li>
- *   <li>Without the lock: rebuild the file from the copies, delete the copies, and check the
- *       result's size and SHA-256 against the manifest. Only a file that passes is returned.</li>
+ *   <li>Without the lock: check every copy against its chunk's SHA-256 in the manifest (format 2
+ *       manifests; a damaged chunk is named in the error), rebuild the file from the copies,
+ *       delete the copies, and check the result's size and SHA-256 against the manifest. Only a
+ *       file that passes every check is returned.</li>
  * </ol>
  */
 class FileService {
@@ -143,11 +146,18 @@ class FileService {
         Objects.requireNonNull(body, "body must not be null");
         Objects.requireNonNull(workspace, "workspace must not be null");
 
-        String sha256 = new ChecksumService().calculateSha256(body);
+        ChecksumService checksums = new ChecksumService();
+        String sha256 = checksums.calculateSha256(body);
         long size = Files.size(body);
         if (expectedSha256 != null && !sha256.equals(expectedSha256.toLowerCase(Locale.ROOT))) {
             throw new FileServiceException(FileServiceException.Reason.CHECKSUM_MISMATCH,
                     "the uploaded data has SHA-256 " + sha256 + ", not the expected " + expectedSha256, null);
+        }
+        long chunkCount = size / chunkSize + (size % chunkSize == 0 ? 0 : 1);
+        if (chunkCount > FileManifest.MAX_CHECKSUMMED_CHUNKS) {
+            throw new FileServiceException(FileServiceException.Reason.TOO_MANY_CHUNKS, "an upload of " + size
+                    + " bytes needs " + chunkCount + " chunks of " + chunkSize + " bytes, more than the "
+                    + FileManifest.MAX_CHECKSUMMED_CHUNKS + " a manifest may list", null);
         }
 
         List<Path> chunks = new FileChunker(chunkSize).chunk(body, workspace.resolve("chunks"));
@@ -156,8 +166,14 @@ class FileService {
         } catch (IOException ignored) {
             // the workspace deletion after the request removes it
         }
+        // The SHA-256 of every chunk, from the exact files that are about to be stored (each node
+        // copies its chunk byte for byte). Like the whole-file hash, this happens before the lock.
+        List<String> chunkSha256s = new ArrayList<>();
+        for (Path chunk : chunks) {
+            chunkSha256s.add(checksums.calculateSha256(chunk));
+        }
         synchronized (storageLock) {
-            return storeLocked(chunks, size, sha256);
+            return storeLocked(chunks, size, sha256, chunkSha256s);
         }
     }
 
@@ -202,6 +218,7 @@ class FileService {
         }
 
         // The copies are this request's own; nothing below needs the lock.
+        verifyChunkCopies(manifest, copies);
         Path file = workspace.resolve("file");
         long size;
         String sha256;
@@ -227,6 +244,37 @@ class FileService {
         return new Download(manifest, file);
     }
 
+    /**
+     * Checks every retrieved chunk copy against the SHA-256 its manifest records, in order, before
+     * the file is rebuilt, so a damaged chunk is found and named instead of being joined into the
+     * file. A format 1 manifest records no chunk checksums; its chunks are not checked here, and
+     * only the whole-file check after rebuilding applies.
+     *
+     * @throws FileServiceException INTEGRITY_CHECK_FAILED for the first chunk that differs, or
+     *         STORAGE_ERROR if a copy cannot be read
+     */
+    private void verifyChunkCopies(FileManifest manifest, List<Path> copies) throws FileServiceException {
+        if (!manifest.hasChunkChecksums()) {
+            return;
+        }
+        ChecksumService checksums = new ChecksumService();
+        for (int i = 0; i < copies.size(); i++) {
+            String actual;
+            try {
+                actual = checksums.calculateSha256(copies.get(i));
+            } catch (IOException | RuntimeException e) {
+                throw storageError("chunk " + manifest.chunkId(i) + " of file " + manifest.fileId()
+                        + " could not be read for verification", e);
+            }
+            String expected = manifest.chunkSha256s().get(i);
+            if (!actual.equals(expected)) {
+                throw new FileServiceException(FileServiceException.Reason.INTEGRITY_CHECK_FAILED,
+                        "chunk " + i + " (" + manifest.chunkId(i) + ") of file " + manifest.fileId() + " has SHA-256 "
+                                + actual + ", but its manifest records " + expected, null);
+            }
+        }
+    }
+
     /** The manifest of a file to download. Must be called holding the storage lock. */
     private FileManifest readManifestForDownload(String fileId) throws FileServiceException {
         Optional<FileManifest> manifest;
@@ -246,9 +294,10 @@ class FileService {
     }
 
     /** Steps 3 and 4 of the class comment. Must be called holding the storage lock. */
-    private FileManifest storeLocked(List<Path> chunks, long size, String sha256) throws FileServiceException {
+    private FileManifest storeLocked(List<Path> chunks, long size, String sha256, List<String> chunkSha256s)
+            throws FileServiceException {
         String fileId = unusedFileId();
-        FileManifest manifest = new FileManifest(fileId, size, sha256, chunkSize, chunks.size());
+        FileManifest manifest = new FileManifest(fileId, size, sha256, chunkSize, chunks.size(), chunkSha256s);
         try {
             manifests.createPending(new ManifestStore.PendingUpload(fileId, chunks.size()));
         } catch (IOException | RuntimeException e) {

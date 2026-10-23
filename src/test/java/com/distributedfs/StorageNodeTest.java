@@ -144,6 +144,8 @@ public class StorageNodeTest {
                 StorageNodeTest::deleteRefusesDirectoryEntry);
         runTest("deleteChunk refuses a junction under the chunk's ID and leaves it and its target untouched",
                 StorageNodeTest::deleteRefusesJunctionEntry);
+        runTest("deleteChunk refuses a dangling junction under the chunk's ID instead of reporting the chunk absent",
+                StorageNodeTest::deleteRefusesDanglingJunctionEntry);
         runTest("a failing delete is reported and the chunk stays", StorageNodeTest::injectedDeleteFailurePropagates);
         runTest("a chunk that vanishes just before the delete is reported as absent after a recheck",
                 StorageNodeTest::raceChunkVanishedReturnsFalse);
@@ -163,6 +165,10 @@ public class StorageNodeTest {
                 StorageNodeTest::retrieveRefusesDanglingJunctionEntry);
         runTest("retrieveChunk refuses a junction in place of the storage directory and reads nothing behind it",
                 StorageNodeTest::retrieveRefusesJunctionedStorageDir);
+        runTest("storeChunk refuses a junction in place of the storage directory and writes nothing behind it",
+                StorageNodeTest::storeRefusesJunctionedStorageDir);
+        runTest("storeChunk reports a junctioned storage directory, not a duplicate, when the folder behind it has the chunk's name",
+                StorageNodeTest::storeReportsJunctionNotDuplicate);
         runTest("retrieveChunk refuses a symbolic link to a regular file and copies nothing",
                 StorageNodeTest::retrieveRefusesFileSymlinkEntry);
 
@@ -828,6 +834,29 @@ public class StorageNodeTest {
     }
 
     /**
+     * The delete counterpart of the dangling-junction retrieve test. A link-following check finds
+     * nothing behind the junction and would answer "absent" (false); the no-follow check sees an
+     * entry that is not a regular file. This is the case that detects deliberate break DB21 (the
+     * delete check following links) without symbolic-link rights.
+     */
+    private static void deleteRefusesDanglingJunctionEntry(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir);
+        Path gone = Files.createDirectory(tempDir.resolve("gone"));
+        Path entry = nodeDir.resolve("chunk_0");
+        createDirectoryJunction(entry, gone);
+        Files.delete(gone); // the junction now points at nothing
+        try {
+            IOException e = expectThrows(IOException.class, "deleteChunk", () -> node.deleteChunk("chunk_0"));
+            checkContains(e.getMessage(), "not a regular file");
+            expectThrows(IOException.class, "holdsRegularChunkFile", () -> node.holdsRegularChunkFile("chunk_0"));
+            check(Files.exists(entry, LinkOption.NOFOLLOW_LINKS), "the junction is left in place");
+        } finally {
+            Files.deleteIfExists(entry); // removes the junction itself
+        }
+    }
+
+    /**
      * A junction whose target is gone: following it finds nothing, which a link-following check
      * would report as "chunk missing". The no-follow check sees an entry that is not a regular
      * file, so the node says it cannot tell.
@@ -870,6 +899,55 @@ public class StorageNodeTest {
             check(Files.exists(nodeDir, LinkOption.NOFOLLOW_LINKS), "the junction is left in place");
             checkEquals(List.of("chunk_0"), listNames(outside), "files behind the junction");
             checkBytes(outsideData, outside.resolve("chunk_0"));
+        } finally {
+            Files.deleteIfExists(nodeDir); // removes the junction itself, never its target
+        }
+    }
+
+    /**
+     * The folder behind the junction already holds a file named like the chunk. The duplicate
+     * check follows links, so before the fix it ran first and reported "chunk already exists"
+     * (FileAlreadyExistsException), hiding the real problem. The storage directory must be
+     * reported, and the file behind the junction must be left alone.
+     */
+    private static void storeReportsJunctionNotDuplicate(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir);
+        Path source = Files.write(tempDir.resolve("source.bin"), randomBytes(64, 5));
+        Path outside = Files.createDirectory(tempDir.resolve("outside"));
+        byte[] outsideData = randomBytes(32, 6);
+        Files.write(outside.resolve("chunk_0"), outsideData);
+        Files.delete(nodeDir);
+        createDirectoryJunction(nodeDir, outside);
+        try {
+            IOException e = expectThrows(IOException.class, () -> node.storeChunk("chunk_0", source));
+            check(!(e instanceof FileAlreadyExistsException),
+                    "a junctioned storage directory must not be reported as a duplicate chunk: " + e);
+            checkContains(e.getMessage(), "not a plain directory");
+            checkEquals(List.of("chunk_0"), listNames(outside), "files behind the junction");
+            checkBytes(outsideData, outside.resolve("chunk_0"));
+        } finally {
+            Files.deleteIfExists(nodeDir); // removes the junction itself, never its target
+        }
+    }
+
+    /**
+     * A junction in place of the storage directory: before the fix, the store followed it and
+     * wrote the chunk (and its temp file) into the folder behind the junction, outside the node.
+     */
+    private static void storeRefusesJunctionedStorageDir(Path tempDir) throws IOException {
+        Path nodeDir = tempDir.resolve("node");
+        StorageNode node = new StorageNode(nodeDir);
+        Path source = Files.write(tempDir.resolve("source.bin"), randomBytes(64, 5));
+        Path outside = Files.createDirectory(tempDir.resolve("outside"));
+        Files.writeString(outside.resolve("precious.txt"), "precious");
+        Files.delete(nodeDir);
+        createDirectoryJunction(nodeDir, outside);
+        try {
+            IOException e = expectThrows(IOException.class, () -> node.storeChunk("chunk_0", source));
+            checkContains(e.getMessage(), "not a plain directory");
+            checkEquals(List.of("precious.txt"), listNames(outside), "files behind the junction");
+            check(Files.exists(nodeDir, LinkOption.NOFOLLOW_LINKS), "the junction is left in place");
         } finally {
             Files.deleteIfExists(nodeDir); // removes the junction itself, never its target
         }

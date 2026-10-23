@@ -1,0 +1,49 @@
+# Builds DistributedFS with plain javac and runs its plain-Java test suites on Windows.
+# The tests use Windows junctions (cmd /c mklink /J) and Windows-specific file-system behavior,
+# so the job runs on a Windows runner only. No secrets or extra permissions are needed.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '23'
+
+      # Reports whether this runner may create symbolic links. The four symbolic-link tests
+      # skip themselves (and say so) when it may not; they are never counted as passed.
+      - name: Check symbolic-link permission
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP 'symlink-target.txt'
+          $link = Join-Path $env:RUNNER_TEMP 'symlink-probe.txt'
+          Set-Content -Path $target -Value 'probe'
+          try {
+            New-Item -ItemType SymbolicLink -Path $link -Target $target -ErrorAction Stop | Out-Null
+            Write-Host 'This runner can create symbolic links: the symbolic-link tests should run.'
+          } catch {
+            Write-Host "This runner cannot create symbolic links ($($_.Exception.Message)); those tests will be skipped."
+          }
+
+      - name: Normal tests
+        shell: pwsh
+        run: ./scripts/test.ps1
+
+      - name: Stress tests (16 MiB heap)
+        shell: pwsh
+        run: ./scripts/test.ps1 -Stress

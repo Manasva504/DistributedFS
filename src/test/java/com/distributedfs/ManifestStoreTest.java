@@ -62,6 +62,15 @@ public class ManifestStoreTest {
         runTest("the manifest constructor rejects invalid values", ManifestStoreTest::manifestConstructorRejects);
         runTest("chunkId derives F_i and checks the index", ManifestStoreTest::manifestChunkIds);
         runTest("every malformed manifest text is rejected", ManifestStoreTest::malformedManifestsAreRejected);
+        runTest("a format 2 manifest has one SHA-256 line per chunk and round-trips, through the store too",
+                ManifestStoreTest::format2RoundTrips);
+        runTest("a format 1 manifest is still read, and reports no chunk checksums",
+                ManifestStoreTest::format1IsStillRead);
+        runTest("every malformed format 2 manifest text is rejected", ManifestStoreTest::malformedFormat2IsRejected);
+        runTest("the manifest constructor checks the chunk checksums and their count",
+                ManifestStoreTest::chunkChecksumsAreValidated);
+        runTest("the largest format 2 manifest fits the read limit and round-trips",
+                ManifestStoreTest::largestFormat2FitsTheLimit);
 
         // Pending-upload marker
         runTest("a pending marker has its own strict three-line format", ManifestStoreTest::pendingFormat);
@@ -164,6 +173,108 @@ public class ManifestStoreTest {
         expectThrows(IndexOutOfBoundsException.class, "chunk 0 of an empty file", () -> empty.chunkId(0));
     }
 
+    private static final List<String> CHUNK_SHAS = List.of("a".repeat(64), "b".repeat(64), "c".repeat(64));
+
+    /** SAMPLE with chunk checksums: format 2. */
+    private static final FileManifest SAMPLE2 = new FileManifest(ID, 2_500_000, SHA, MIB, 3, CHUNK_SHAS);
+
+    private static final String SAMPLE2_TEXT = SAMPLE_TEXT.replace("format=1", "format=2")
+            + "chunk0.sha256=" + CHUNK_SHAS.get(0) + "\n"
+            + "chunk1.sha256=" + CHUNK_SHAS.get(1) + "\n"
+            + "chunk2.sha256=" + CHUNK_SHAS.get(2) + "\n";
+
+    private static void format2RoundTrips(Path tempDir) throws IOException {
+        checkEquals(SAMPLE2_TEXT, SAMPLE2.toText(), "the format 2 text");
+        checkEquals(SAMPLE2, FileManifest.parse(SAMPLE2_TEXT, ID), "parsed back");
+        checkEquals(2, SAMPLE2.format(), "format");
+        check(SAMPLE2.hasChunkChecksums(), "has chunk checksums");
+
+        FileManifest empty = new FileManifest(ID, 0, EMPTY_SHA, MIB, 0, List.of());
+        checkEquals("format=2\nfileId=" + ID + "\nsize=0\nsha256=" + EMPTY_SHA + "\nchunkSize=1048576\nchunkCount=0\n",
+                empty.toText(), "an empty file in format 2 has no chunk lines");
+        checkEquals(empty, FileManifest.parse(empty.toText(), ID), "the empty format 2 manifest parsed back");
+        check(empty.hasChunkChecksums(), "an empty format 2 file still counts as checksummed (zero chunks)");
+
+        ManifestStore store = new ManifestStore(Files.createDirectory(tempDir.resolve("manifests")));
+        store.create(SAMPLE2);
+        checkEquals(SAMPLE2_TEXT, Files.readString(tempDir.resolve("manifests").resolve(ID + ".manifest")), "the file");
+        checkEquals(SAMPLE2, store.read(ID).orElseThrow(), "read from the store");
+    }
+
+    private static void format1IsStillRead(Path tempDir) throws IOException {
+        FileManifest legacy = FileManifest.parse(SAMPLE_TEXT, ID);
+        checkEquals(SAMPLE, legacy, "the format 1 manifest");
+        check(!legacy.hasChunkChecksums(), "no chunk checksums");
+        checkEquals(null, legacy.chunkSha256s(), "chunkSha256s");
+        checkEquals(1, legacy.format(), "format");
+        checkEquals(SAMPLE_TEXT, legacy.toText(), "written back unchanged as format 1");
+        check(!SAMPLE.equals(SAMPLE2), "a format 1 and a format 2 manifest are never equal");
+    }
+
+    private static void malformedFormat2IsRejected(Path tempDir) throws IOException {
+        String c0 = "chunk0.sha256=" + CHUNK_SHAS.get(0) + "\n";
+        String c1 = "chunk1.sha256=" + CHUNK_SHAS.get(1) + "\n";
+        String c2 = "chunk2.sha256=" + CHUNK_SHAS.get(2) + "\n";
+        String[][] variants = {
+                {"a missing chunk line", SAMPLE2_TEXT.replace(c2, "")},
+                {"an extra chunk line", SAMPLE2_TEXT + "chunk3.sha256=" + "d".repeat(64) + "\n"},
+                {"chunk lines out of order", SAMPLE2_TEXT.replace(c0 + c1, c1 + c0)},
+                {"a chunk index with a leading zero", SAMPLE2_TEXT.replace("chunk1.sha256", "chunk01.sha256")},
+                {"an uppercase chunk checksum", SAMPLE2_TEXT.replace("b".repeat(64), "B".repeat(64))},
+                {"a short chunk checksum", SAMPLE2_TEXT.replace("b".repeat(64), "b".repeat(63))},
+                {"an empty chunk checksum", SAMPLE2_TEXT.replace("b".repeat(64), "")},
+                {"a non-hex chunk checksum", SAMPLE2_TEXT.replace("b".repeat(64), "g".repeat(64))},
+                {"another key instead of a chunk line", SAMPLE2_TEXT.replace("chunk1.sha256=", "chunk1.md5=")},
+                {"no final line feed", SAMPLE2_TEXT.substring(0, SAMPLE2_TEXT.length() - 1)},
+                {"CRLF line endings", SAMPLE2_TEXT.replace("\n", "\r\n")},
+                {"a trailing blank line", SAMPLE2_TEXT + "\n"},
+                {"format 1 with chunk lines", SAMPLE2_TEXT.replace("format=2", "format=1")},
+                {"more chunks than a manifest may list",
+                        "format=2\nfileId=" + ID + "\nsize=" + (FileManifest.MAX_CHECKSUMMED_CHUNKS + 1) + "\nsha256="
+                                + SHA + "\nchunkSize=1\nchunkCount=" + (FileManifest.MAX_CHECKSUMMED_CHUNKS + 1) + "\n"},
+        };
+        checkEquals(SAMPLE2, FileManifest.parse(SAMPLE2_TEXT, ID), "the unmodified sample (control)");
+        for (String[] variant : variants) {
+            expectThrows(InvalidManifestException.class, variant[0], () -> FileManifest.parse(variant[1], ID));
+        }
+    }
+
+    private static void chunkChecksumsAreValidated(Path tempDir) {
+        expectThrows(IllegalArgumentException.class, "too few checksums",
+                () -> new FileManifest(ID, 2_500_000, SHA, MIB, 3, CHUNK_SHAS.subList(0, 2)));
+        expectThrows(IllegalArgumentException.class, "too many checksums",
+                () -> new FileManifest(ID, 2_500_000, SHA, MIB, 3, List.of(SHA, SHA, SHA, SHA)));
+        expectThrows(IllegalArgumentException.class, "an uppercase checksum",
+                () -> new FileManifest(ID, 2_500_000, SHA, MIB, 3, List.of(SHA, SHA, SHA.toUpperCase(Locale.ROOT))));
+        expectThrows(IllegalArgumentException.class, "a short checksum",
+                () -> new FileManifest(ID, 2_500_000, SHA, MIB, 3, List.of(SHA, SHA, SHA.substring(1))));
+        List<String> withNull = new java.util.ArrayList<>(List.of(SHA, SHA));
+        withNull.add(null);
+        expectThrows(NullPointerException.class, "a null checksum",
+                () -> new FileManifest(ID, 2_500_000, SHA, MIB, 3, withNull));
+        int over = FileManifest.MAX_CHECKSUMMED_CHUNKS + 1;
+        expectThrows(IllegalArgumentException.class, "more chunks than a manifest may list",
+                () -> new FileManifest(ID, over, SHA, 1, over, java.util.Collections.nCopies(over, SHA)));
+        // The list is copied: later changes to the caller's list do not change the manifest.
+        List<String> mutable = new java.util.ArrayList<>(CHUNK_SHAS);
+        FileManifest manifest = new FileManifest(ID, 2_500_000, SHA, MIB, 3, mutable);
+        mutable.set(0, SHA);
+        checkEquals(CHUNK_SHAS, manifest.chunkSha256s(), "the manifest's own copy");
+    }
+
+    private static void largestFormat2FitsTheLimit(Path tempDir) throws IOException {
+        int max = FileManifest.MAX_CHECKSUMMED_CHUNKS;
+        FileManifest largest = new FileManifest(ID, (long) max * Integer.MAX_VALUE, SHA, Integer.MAX_VALUE, max,
+                java.util.Collections.nCopies(max, SHA));
+        String text = largest.toText();
+        check(text.length() <= FileManifest.MAX_TEXT_BYTES,
+                "the largest manifest (" + text.length() + " bytes) fits the limit of " + FileManifest.MAX_TEXT_BYTES);
+        checkEquals(largest, FileManifest.parse(text, ID), "parsed back");
+        ManifestStore store = new ManifestStore(Files.createDirectory(tempDir.resolve("manifests")));
+        store.create(largest);
+        checkEquals(largest, store.read(ID).orElseThrow(), "read back through the store's size limit");
+    }
+
     private static void malformedManifestsAreRejected(Path tempDir) throws IOException {
         checkEquals(SAMPLE, FileManifest.parse(SAMPLE_TEXT, ID), "the unmodified sample (control)");
         String[][] variants = {
@@ -178,7 +289,8 @@ public class ManifestStoreTest {
                         "sha256=" + SHA + "\nsize=2500000\n")},
                 {"an unknown key", SAMPLE_TEXT.replace("chunkSize=", "chunk_size=")},
                 {"a key in another case", SAMPLE_TEXT.replace("fileId=", "fileid=")},
-                {"format 2", SAMPLE_TEXT.replace("format=1", "format=2")},
+                {"format 2 without its chunk lines", SAMPLE_TEXT.replace("format=1", "format=2")},
+                {"format 3", SAMPLE_TEXT.replace("format=1", "format=3")},
                 {"format with a leading zero", SAMPLE_TEXT.replace("format=1", "format=01")},
                 {"spaces around '='", SAMPLE_TEXT.replace("size=2500000", "size = 2500000")},
                 {"a trailing space", SAMPLE_TEXT.replace("size=2500000", "size=2500000 ")},

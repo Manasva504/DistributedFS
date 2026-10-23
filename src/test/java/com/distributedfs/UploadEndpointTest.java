@@ -94,6 +94,8 @@ public class UploadEndpointTest {
         runTest("a malformed or repeated X-Content-SHA256 is 400 invalid_checksum and stores nothing",
                 UploadEndpointTest::invalidChecksumHeaders);
         runTest("only exactly one application/octet-stream Content-Type is accepted", UploadEndpointTest::contentTypes);
+        runTest("an upload needing more chunks than a manifest may list is 413 and stores nothing",
+                UploadEndpointTest::tooManyChunksIs413);
         runTest("the size limit is enforced from Content-Length and while reading a chunked body",
                 UploadEndpointTest::sizeLimit);
         runTest("a Content-Length over 100 MiB is refused after at most 64 KiB of the body is read",
@@ -153,7 +155,7 @@ public class UploadEndpointTest {
             String fileId = location.substring("/files/".length());
             check(FileIds.isValid(fileId), "the Location ends with a valid file ID: " + location);
             FileManifest manifest = server.manifests().read(fileId).orElseThrow();
-            checkEquals(new FileManifest(fileId, 10, sha256(data), 4, 3), manifest, "the stored manifest");
+            checkEquals(new FileManifest(fileId, 10, sha256(data), 4, 3, chunkSha256s(data, 4)), manifest, "the stored manifest");
             checkEquals("{\"fileId\":\"" + fileId + "\",\"size\":10,\"sha256\":\"" + sha256(data)
                     + "\",\"chunkSize\":4,\"chunkCount\":3}", response.body(), "the JSON body");
             checkEquals("application/json; charset=utf-8", response.headers().firstValue("Content-Type").orElse(null),
@@ -203,7 +205,7 @@ public class UploadEndpointTest {
             String fileId = response.header("location").substring("/files/".length());
             FileManifest manifest = server.manifests().read(fileId).orElseThrow();
             byte[] all = concat(part1, part2);
-            checkEquals(new FileManifest(fileId, all.length, sha256(all), 4, (all.length + 3) / 4), manifest,
+            checkEquals(new FileManifest(fileId, all.length, sha256(all), 4, (all.length + 3) / 4, chunkSha256s(all, 4)), manifest,
                     "the manifest");
             check(Arrays.equals(all, readBack(server, manifest, tempDir)), "the file reads back identically");
             checkTmpIsEmpty(server);
@@ -303,6 +305,15 @@ public class UploadEndpointTest {
                         head("POST", "/files", server, lines + "Content-Length: 5\r\n"), bytes(5, 1));
                 checkEquals(201, response.status(), "status for \"" + lines.trim() + "\"");
             }
+        });
+    }
+
+    /** Only reachable with a tiny chunk size: 1-byte chunks and one byte more than the maximum chunk count. */
+    private static void tooManyChunksIs413(Path tempDir) throws Exception {
+        withServer(tempDir, 1024 * 1024, 1, server -> {
+            RawResponse response = post(server, bytes(FileManifest.MAX_CHECKSUMMED_CHUNKS + 1, 1));
+            checkErrorResponse(response, ApiError.PAYLOAD_TOO_LARGE, server, "too many chunks");
+            checkNothingStored(server);
         });
     }
 
@@ -1066,6 +1077,15 @@ public class UploadEndpointTest {
 
     private static String sha256(byte[] data) {
         return HexFormat.of().formatHex(newDigest().digest(data));
+    }
+
+    /** The SHA-256 of every {@code chunkSize}-byte piece of {@code data}, computed independently. */
+    private static List<String> chunkSha256s(byte[] data, int chunkSize) {
+        List<String> sums = new ArrayList<>();
+        for (int offset = 0; offset < data.length; offset += chunkSize) {
+            sums.add(sha256(Arrays.copyOfRange(data, offset, Math.min(data.length, offset + chunkSize))));
+        }
+        return sums;
     }
 
     private static List<String> listNames(Path directory) throws IOException {

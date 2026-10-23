@@ -13,6 +13,12 @@ class FileServiceException extends IOException {
     enum Reason {
         /** The uploaded bytes do not match the checksum the client sent; nothing was stored. */
         CHECKSUM_MISMATCH,
+        /**
+         * The upload would need more chunks than a manifest may list
+         * ({@link FileManifest#MAX_CHECKSUMMED_CHUNKS}); nothing was stored. Only possible with a
+         * very small configured chunk size.
+         */
+        TOO_MANY_CHUNKS,
         /** No manifest exists for the requested file ID: the file was never committed. */
         FILE_NOT_FOUND,
         /** The requested file's manifest exists but cannot be trusted. */

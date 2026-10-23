@@ -1,48 +1,78 @@
 package com.distributedfs;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 
 /**
- * What the server records about one stored file: its ID, size, SHA-256, and how it was split
- * into chunks.
+ * What the server records about one stored file: its ID, size, SHA-256, how it was split into
+ * chunks, and (for files stored since format 2) the SHA-256 of every chunk.
  *
- * <p><b>Text format.</b> A manifest is stored as six lines of plain ASCII, each ending in a line
- * feed, always in this order:
+ * <p><b>Text format.</b> A manifest is plain ASCII, one {@code key=value} per line, each line
+ * ending in a line feed, always in this order:
  * <pre>
- *   format=1
+ *   format=2
  *   fileId=0123456789abcdef0123456789abcdef
  *   size=3145729
- *   sha256=&lt;64 lowercase hexadecimal characters&gt;
+ *   sha256=&lt;64 lowercase hexadecimal characters: the whole file&gt;
  *   chunkSize=1048576
  *   chunkCount=4
+ *   chunk0.sha256=&lt;64 lowercase hexadecimal characters: chunk 0&gt;
+ *   chunk1.sha256=...
+ *   chunk2.sha256=...
+ *   chunk3.sha256=...
  * </pre>
- * Reading is strict: exactly these keys, once each, in this order, written exactly as
+ * Every upload writes format 2. <b>Format 1</b>, written before per-chunk checksums existed, is
+ * the same first six lines with {@code format=1} and no chunk lines; it is still read, and such a
+ * manifest simply has no chunk checksums ({@link #chunkSha256s()} is null). It is never treated as
+ * if its chunks had been verified individually.
+ *
+ * <p>Reading is strict: exactly these keys, once each, in this order, written exactly as
  * {@link #toText()} writes them (no spaces, no leading zeros, no "+" signs, no CR). Anything else
  * is reported as a damaged manifest, never quietly accepted or repaired.
  *
  * <p><b>Chunks.</b> Chunk {@code i} has the ID {@link FileIds#chunkId FileIds.chunkId(fileId, i)}.
  * The chunk IDs are derived rather than stored, so a damaged manifest can never point at the
  * chunks of another file. {@code chunkCount} must equal {@code ceil(size / chunkSize)}; an empty
- * file has no chunks.
+ * file has no chunks. A format 2 manifest has exactly one checksum per chunk, and at most
+ * {@link #MAX_CHECKSUMMED_CHUNKS} chunks, which bounds its size.
  *
- * @param fileId     a valid file ID (see {@link FileIds})
- * @param size       the file's size in bytes, 0 or more
- * @param sha256     the SHA-256 of the whole file, 64 lowercase hexadecimal characters
- * @param chunkSize  the size of every chunk except the last, at least 1
- * @param chunkCount the number of chunks: {@code ceil(size / chunkSize)}
+ * @param fileId       a valid file ID (see {@link FileIds})
+ * @param size         the file's size in bytes, 0 or more
+ * @param sha256       the SHA-256 of the whole file, 64 lowercase hexadecimal characters
+ * @param chunkSize    the size of every chunk except the last, at least 1
+ * @param chunkCount   the number of chunks: {@code ceil(size / chunkSize)}
+ * @param chunkSha256s the SHA-256 of each chunk in order (64 lowercase hexadecimal characters
+ *                     each, exactly {@code chunkCount} of them), or null for a format 1 manifest
  */
-record FileManifest(String fileId, long size, String sha256, int chunkSize, int chunkCount) {
+record FileManifest(String fileId, long size, String sha256, int chunkSize, int chunkCount, List<String> chunkSha256s) {
 
-    /** The only format version written and accepted so far. */
+    /**
+     * Format 1: no chunk checksums. Also the format of pending-upload markers, which never
+     * changed (see ManifestStore.PendingUpload).
+     */
     static final int FORMAT_VERSION = 1;
 
-    /** Manifests are a few hundred bytes; anything larger than this is rejected without parsing. */
-    static final int MAX_TEXT_BYTES = 4 * 1024;
+    /** Format 2: one SHA-256 per chunk. Every new manifest is written in this format. */
+    static final int CHUNK_CHECKSUM_FORMAT = 2;
+
+    /**
+     * The most chunks a format 2 manifest may list. With the default 1 MiB chunks this is 64 GiB,
+     * far above the largest upload the server accepts (1024 MiB); only very small configured chunk
+     * sizes can reach it, and FileService refuses such an upload before storing anything.
+     */
+    static final int MAX_CHECKSUMMED_CHUNKS = 65_536;
+
+    /**
+     * The largest manifest text accepted; anything larger is rejected without parsing. A format 2
+     * manifest with the maximum number of chunks is about 5.4 MB (83 bytes per chunk line).
+     */
+    static final int MAX_TEXT_BYTES = 6 * 1024 * 1024;
 
     private static final String[] KEYS = {"format", "fileId", "size", "sha256", "chunkSize", "chunkCount"};
 
     /**
-     * @throws NullPointerException if {@code fileId} or {@code sha256} is null
+     * @throws NullPointerException if {@code fileId}, {@code sha256} or a chunk checksum is null
      * @throws IllegalArgumentException if any value breaks the rules above
      */
     FileManifest {
@@ -65,6 +95,29 @@ record FileManifest(String fileId, long size, String sha256, int chunkSize, int 
             throw new IllegalArgumentException("chunkCount must be " + expected + " for size " + size
                     + " and chunkSize " + chunkSize + ", but was " + chunkCount);
         }
+        if (chunkSha256s != null) {
+            if (chunkCount > MAX_CHECKSUMMED_CHUNKS) {
+                throw new IllegalArgumentException("a manifest with chunk checksums may list at most "
+                        + MAX_CHECKSUMMED_CHUNKS + " chunks, but this one has " + chunkCount);
+            }
+            if (chunkSha256s.size() != chunkCount) {
+                throw new IllegalArgumentException("there must be one chunk checksum per chunk: " + chunkCount
+                        + " chunks but " + chunkSha256s.size() + " checksums");
+            }
+            for (int i = 0; i < chunkSha256s.size(); i++) {
+                String chunkSha256 = Objects.requireNonNull(chunkSha256s.get(i), "chunk checksum " + i + " must not be null");
+                if (!isLowercaseSha256(chunkSha256)) {
+                    throw new IllegalArgumentException("the checksum of chunk " + i
+                            + " must be 64 lowercase hexadecimal characters");
+                }
+            }
+            chunkSha256s = List.copyOf(chunkSha256s);
+        }
+    }
+
+    /** A format 1 manifest: no chunk checksums. */
+    FileManifest(String fileId, long size, String sha256, int chunkSize, int chunkCount) {
+        this(fileId, size, sha256, chunkSize, chunkCount, null);
     }
 
     /**
@@ -96,41 +149,98 @@ record FileManifest(String fileId, long size, String sha256, int chunkSize, int 
         return FileIds.chunkId(fileId, index);
     }
 
-    /** The manifest as stored on disk: six lines, each ending in a line feed. */
+    /** True for a format 2 manifest, which records the SHA-256 of every chunk. */
+    boolean hasChunkChecksums() {
+        return chunkSha256s != null;
+    }
+
+    /** The manifest's format number: 2 with chunk checksums, 1 without. */
+    int format() {
+        return hasChunkChecksums() ? CHUNK_CHECKSUM_FORMAT : FORMAT_VERSION;
+    }
+
+    /** The manifest as stored on disk, one line per key, each ending in a line feed. */
     String toText() {
-        return "format=" + FORMAT_VERSION + "\n"
-                + "fileId=" + fileId + "\n"
-                + "size=" + size + "\n"
-                + "sha256=" + sha256 + "\n"
-                + "chunkSize=" + chunkSize + "\n"
-                + "chunkCount=" + chunkCount + "\n";
+        StringBuilder text = new StringBuilder()
+                .append("format=").append(format()).append('\n')
+                .append("fileId=").append(fileId).append('\n')
+                .append("size=").append(size).append('\n')
+                .append("sha256=").append(sha256).append('\n')
+                .append("chunkSize=").append(chunkSize).append('\n')
+                .append("chunkCount=").append(chunkCount).append('\n');
+        if (chunkSha256s != null) {
+            for (int i = 0; i < chunkSha256s.size(); i++) {
+                text.append(chunkKey(i)).append('=').append(chunkSha256s.get(i)).append('\n');
+            }
+        }
+        return text.toString();
     }
 
     /**
-     * Reads a manifest written by {@link #toText()}.
+     * Reads a manifest written by {@link #toText()}, in format 1 or 2.
      *
      * @param expectedFileId the ID this manifest must describe (the ID in its file name)
      * @throws InvalidManifestException if the text is not exactly a valid manifest for
      *         {@code expectedFileId}
      */
     static FileManifest parse(String text, String expectedFileId) throws InvalidManifestException {
-        String[] values = readFields(text, KEYS);
-        if (!values[0].equals(String.valueOf(FORMAT_VERSION))) {
+        Objects.requireNonNull(text, "text must not be null");
+        // The first six lines are the same in both formats; the format line decides what follows.
+        String header = firstLines(text, KEYS.length);
+        String[] values = readFields(header, KEYS);
+        boolean withChunkChecksums;
+        if (values[0].equals(String.valueOf(FORMAT_VERSION))) {
+            withChunkChecksums = false;
+        } else if (values[0].equals(String.valueOf(CHUNK_CHECKSUM_FORMAT))) {
+            withChunkChecksums = true;
+        } else {
             throw new InvalidManifestException("unsupported manifest format \"" + values[0] + "\"");
         }
         if (!values[1].equals(expectedFileId)) {
             throw new InvalidManifestException("the manifest describes a different file ID than its name says");
         }
+        int chunkCount = toInt(parseNumber(values[5], "chunkCount"), "chunkCount");
+        List<String> chunkSha256s = null;
+        if (withChunkChecksums) {
+            if (chunkCount > MAX_CHECKSUMMED_CHUNKS) {
+                throw new InvalidManifestException("chunkCount is larger than " + MAX_CHECKSUMMED_CHUNKS);
+            }
+            String[] keys = new String[chunkCount];
+            for (int i = 0; i < chunkCount; i++) {
+                keys[i] = chunkKey(i);
+            }
+            chunkSha256s = new ArrayList<>(List.of(readFields(text.substring(header.length()), keys)));
+        }
         FileManifest manifest;
         try {
             manifest = new FileManifest(values[1], parseNumber(values[2], "size"), values[3],
-                    toInt(parseNumber(values[4], "chunkSize"), "chunkSize"),
-                    toInt(parseNumber(values[5], "chunkCount"), "chunkCount"));
+                    toInt(parseNumber(values[4], "chunkSize"), "chunkSize"), chunkCount, chunkSha256s);
         } catch (IllegalArgumentException e) {
             throw new InvalidManifestException("invalid manifest values: " + e.getMessage(), e);
         }
         requireCanonical(text, manifest.toText());
         return manifest;
+    }
+
+    /** The key of chunk {@code index}'s checksum line: {@code chunk<index>.sha256}. */
+    private static String chunkKey(int index) {
+        return "chunk" + index + ".sha256";
+    }
+
+    /**
+     * The first {@code count} lines of {@code text}, each with its line feed. Fewer lines, or text
+     * that does not end in a line feed, is reported as invalid.
+     */
+    private static String firstLines(String text, int count) throws InvalidManifestException {
+        int end = 0;
+        for (int i = 0; i < count; i++) {
+            int lineFeed = text.indexOf('\n', end);
+            if (lineFeed < 0) {
+                throw new InvalidManifestException("expected at least " + count + " lines ending in a line feed");
+            }
+            end = lineFeed + 1;
+        }
+        return text.substring(0, end);
     }
 
     // ---------------------------------------------------------------------
@@ -140,10 +250,17 @@ record FileManifest(String fileId, long size, String sha256, int chunkSize, int 
     /**
      * Splits {@code text} into exactly {@code keys.length} lines of the form {@code key=value},
      * with the keys in exactly the given order, and returns the values. Every line, including the
-     * last, must end with a line feed. Only printable ASCII is allowed inside a line.
+     * last, must end with a line feed. Only printable ASCII is allowed inside a line. No keys means
+     * the text must be empty.
      */
     static String[] readFields(String text, String... keys) throws InvalidManifestException {
         Objects.requireNonNull(text, "text must not be null");
+        if (keys.length == 0) {
+            if (!text.isEmpty()) {
+                throw new InvalidManifestException("expected no more lines but found more text");
+            }
+            return new String[0];
+        }
         if (!text.endsWith("\n")) {
             throw new InvalidManifestException("the text does not end with a line feed");
         }

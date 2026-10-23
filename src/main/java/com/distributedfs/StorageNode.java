@@ -51,7 +51,10 @@ import java.util.regex.Pattern;
  * directory (not a symbolic link or junction) and the chunk's entry is a regular file. If either
  * cannot be established, nothing is deleted or read and an IOException is thrown. Temp files and
  * other chunks are never touched. (The check and the later open are two steps; as below, the
- * node assumes no other program changes its directory in between.)
+ * node assumes no other program changes its directory in between.) {@link #storeChunk} also
+ * refuses a storage directory that is not a plain directory before anything else, so a chunk is
+ * never written through a link or junction, and a file behind one is never reported as a
+ * duplicate chunk; its existence check, like {@link #hasChunk}, still follows links.
  *
  * <p><b>Assumptions and limits.</b>
  * <ul>
@@ -127,12 +130,25 @@ public class StorageNode {
      *         a directory, not a regular file, or not readable (all checked before anything is written)
      * @throws FileAlreadyExistsException if this node already holds a chunk with this ID
      *         (the existing chunk is left unchanged)
-     * @throws IOException if the node's storage is unavailable or copying fails; the temp file
-     *         is deleted first, so no partial chunk is ever left under {@code chunkId}
+     * @throws IOException if the node's storage is unavailable, is not a plain directory (for
+     *         example it was replaced by a link or junction; nothing is written through it), or
+     *         copying fails; the temp file is deleted first, so no partial chunk is ever left
+     *         under {@code chunkId}
      */
     public long storeChunk(String chunkId, Path sourceFile) throws IOException {
         Path chunkFile = chunkFileFor(chunkId);
         validateSourceFile(sourceFile);
+
+        // Never write through a storage directory that has been replaced by a link or junction,
+        // read without following links, as delete and retrieve already require. This comes before
+        // the duplicate check, which follows links: otherwise a file behind such a junction would be
+        // reported as an existing chunk. Something must exist under the folder's name for this
+        // check to apply; a folder that is gone entirely is reported by chunkExists below as "not
+        // available". (Like the other checks, this is done before the write, not a guarantee
+        // against a swap in between.)
+        if (Files.exists(storageDir, LinkOption.NOFOLLOW_LINKS)) {
+            requirePlainStorageDirectory();
+        }
 
         // Fail fast, before copying anything, if this ID is already taken.
         if (chunkExists(chunkFile)) {
