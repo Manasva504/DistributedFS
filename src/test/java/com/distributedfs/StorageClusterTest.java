@@ -131,6 +131,8 @@ public class StorageClusterTest {
                 StorageClusterTest::deleteRefusesUnsafeEntries);
         runTest("a node whose storage folder became a junction blocks deletion and nothing behind it changes",
                 StorageClusterTest::deleteRefusesJunctionedStorageDir);
+        runTest("a dangling junction under the chunk's ID blocks deletion instead of counting as absent",
+                StorageClusterTest::deleteRefusesDanglingJunctionEntry);
         runTest("the holder's delete failure is passed through and the chunk stays",
                 StorageClusterTest::deleteFailureOnHolderPropagates);
         runTest("a chunk that vanishes on its holder just before the delete is reported as absent",
@@ -143,6 +145,8 @@ public class StorageClusterTest {
         // Retrieving without following links
         runTest("a node whose storage folder became a junction refuses to retrieve and nothing behind it is copied",
                 StorageClusterTest::retrieveRefusesJunctionedStorageDir);
+        runTest("a node whose storage folder became a junction is skipped by stores; nothing is written behind it",
+                StorageClusterTest::storeSkipsJunctionedStorageDir);
         runTest("a symbolic link to a regular file under the chunk's ID is refused, not retrieved",
                 StorageClusterTest::retrieveRefusesFileSymlinkEntry);
 
@@ -864,6 +868,32 @@ public class StorageClusterTest {
         }
     }
 
+    /**
+     * A dangling junction on node 1 under the ID that node 0 holds. A link-following check would
+     * call node 1's entry absent and delete node 0's copy; the no-follow check makes node 1
+     * "not checkable", so nothing is deleted and the answer is never "not found".
+     */
+    private static void deleteRefusesDanglingJunctionEntry(Path tempDir) throws IOException {
+        List<RecordingNode> nodes = recordingNodes(tempDir, 3);
+        StorageCluster cluster = new StorageCluster(new ArrayList<>(nodes));
+        byte[] data = randomBytes(64, 3);
+        cluster.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), data)); // round-robin: node 0
+        Path gone = Files.createDirectory(tempDir.resolve("gone"));
+        Path junction = nodeDir(tempDir, 1).resolve("chunk_0");
+        createDirectoryJunction(junction, gone);
+        Files.delete(gone);
+        try {
+            IOException e = expectThrows(IOException.class, () -> cluster.deleteChunk("chunk_0"));
+            checkContains(e.getMessage(), "node 1 could not be checked safely");
+            checkContains(e.getSuppressed()[0].getMessage(), "not a regular file");
+            checkEquals(List.of(0, 0, 0), nodes.stream().map(node -> node.deletes).toList(), "deletes per node");
+            checkBytes(data, nodeDir(tempDir, 0).resolve("chunk_0"));
+            check(Files.exists(junction, LinkOption.NOFOLLOW_LINKS), "the junction is left in place");
+        } finally {
+            Files.deleteIfExists(junction);
+        }
+    }
+
     private static void deleteRefusesJunctionedStorageDir(Path tempDir) throws IOException {
         List<RecordingNode> nodes = recordingNodes(tempDir, 3);
         StorageCluster cluster = new StorageCluster(new ArrayList<>(nodes));
@@ -1001,6 +1031,26 @@ public class StorageClusterTest {
             checkBytes(outsideData, outside.resolve("chunk_1"));
         } finally {
             Files.deleteIfExists(nodeDir(tempDir, 1)); // removes the junction itself, never its target
+        }
+    }
+
+    /**
+     * Node 0 (the first round-robin choice) has a junction in place of its folder. Its store
+     * fails, so the cluster falls back to node 1 as for any failing node, and the folder behind
+     * the junction stays untouched.
+     */
+    private static void storeSkipsJunctionedStorageDir(Path tempDir) throws IOException {
+        StorageCluster cluster = new StorageCluster(createNodes(tempDir, 3));
+        Path outside = Files.createDirectory(tempDir.resolve("outside"));
+        Files.delete(nodeDir(tempDir, 0));
+        createDirectoryJunction(nodeDir(tempDir, 0), outside);
+        try {
+            byte[] data = randomBytes(64, 9);
+            cluster.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), data));
+            checkEquals(List.of(), listNames(outside), "files behind the junction");
+            checkBytes(data, nodeDir(tempDir, 1).resolve("chunk_0"));
+        } finally {
+            Files.deleteIfExists(nodeDir(tempDir, 0)); // removes the junction itself, never its target
         }
     }
 

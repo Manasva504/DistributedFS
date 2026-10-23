@@ -109,6 +109,18 @@ public class FileServiceTest {
                 FileServiceTest::downloadFailureReasons);
         runTest("an invalid file ID is refused before the storage is touched", FileServiceTest::downloadRejectsInvalidId);
 
+        // Per-chunk checksums (manifest format 2)
+        runTest("a stored manifest records the SHA-256 of every chunk, exactly as stored on the nodes",
+                FileServiceTest::manifestRecordsChunkChecksums);
+        runTest("a damaged chunk is caught before the file is rebuilt, and the error names it",
+                FileServiceTest::damagedChunkIsNamedBeforeRebuilding);
+        runTest("a wrong chunk checksum in the manifest fails the download even though the chunks are intact",
+                FileServiceTest::wrongChunkChecksumInManifestFails);
+        runTest("a format 1 manifest (no chunk checksums) is still served, checked as a whole file",
+                FileServiceTest::legacyManifestIsCheckedAsWholeFile);
+        runTest("an upload needing more chunks than a manifest may list is refused and stores nothing",
+                FileServiceTest::tooManyChunksStoresNothing);
+
         // Workspaces and settings
         runTest("workspaces are created in the tmp folder and deleted afterwards", FileServiceTest::workspaces);
         runTest("invalid settings are refused", FileServiceTest::invalidSettings);
@@ -131,7 +143,7 @@ public class FileServiceTest {
 
         FileManifest manifest = store(service, data, null);
 
-        checkEquals(new FileManifest(id(1), 10, sha256(data), 4, 3), manifest, "the manifest");
+        checkEquals(new FileManifest(id(1), 10, sha256(data), 4, 3, chunkSha256s(data, 4)), manifest, "the manifest");
         checkEquals(manifest, f.manifests.read(id(1)).orElseThrow(), "the stored manifest");
         checkEquals(List.of(), f.manifests.listPendingFileIds(), "pending markers");
         for (int i = 0; i < 3; i++) {
@@ -145,7 +157,7 @@ public class FileServiceTest {
         Fixture f = new Fixture(tempDir);
         FileManifest manifest = store(f.service(4, ids(id(1))), new byte[0], null);
 
-        checkEquals(new FileManifest(id(1), 0, sha256(new byte[0]), 4, 0), manifest, "the manifest");
+        checkEquals(new FileManifest(id(1), 0, sha256(new byte[0]), 4, 0, List.of()), manifest, "the manifest");
         checkEquals(manifest, f.manifests.read(id(1)).orElseThrow(), "the stored manifest");
         checkEquals(0, f.storedChunkFiles(), "chunk files on the nodes");
         checkEquals(List.of(), f.manifests.listPendingFileIds(), "pending markers");
@@ -625,6 +637,93 @@ public class FileServiceTest {
         checkEquals(List.of(), listNames(f.tmpDir), "tmp");
     }
 
+    private static void manifestRecordsChunkChecksums(Path tempDir) throws Exception {
+        Fixture f = new Fixture(tempDir);
+        FileManifest manifest = store(f.service(4, ids(id(1))), bytes(10, 1), null);
+
+        check(manifest.hasChunkChecksums(), "the manifest has chunk checksums");
+        checkEquals(2, manifest.format(), "the manifest format");
+        for (int i = 0; i < manifest.chunkCount(); i++) {
+            checkEquals(sha256(Files.readAllBytes(f.chunkFile(manifest.chunkId(i)))), manifest.chunkSha256s().get(i),
+                    "the recorded checksum of chunk " + i + " (the bytes on its node)");
+        }
+        String text = Files.readString(f.manifestsDir.resolve(id(1) + ".manifest"));
+        check(text.startsWith("format=2\n"), "the stored text is format 2: " + text);
+        check(text.endsWith("chunk2.sha256=" + manifest.chunkSha256s().get(2) + "\n"), "the last line is chunk 2's: " + text);
+    }
+
+    private static void damagedChunkIsNamedBeforeRebuilding(Path tempDir) throws Exception {
+        Fixture f = new Fixture(tempDir);
+        FileService service = f.service(4, ids(id(1)));
+        store(service, bytes(10, 1), null);
+        Path damaged = f.chunkFile(id(1) + "_1");
+        byte[] content = Files.readAllBytes(damaged);
+        content[2] ^= 1; // same size, one bit different
+        Files.write(damaged, content);
+        Map<String, String> before = f.snapshot();
+
+        Path workspace = service.newDownloadWorkspace();
+        try {
+            FileServiceException e = expectThrows(FileServiceException.class, () -> service.download(id(1), workspace));
+            checkEquals(FileServiceException.Reason.INTEGRITY_CHECK_FAILED, e.reason(), "the reason");
+            checkContains(e.getMessage(), "chunk 1 (" + id(1) + "_1)");
+            check(!Files.exists(workspace.resolve("file")), "the file was never rebuilt from the damaged chunk");
+        } finally {
+            service.deleteWorkspace(workspace);
+        }
+        checkEquals(before, f.snapshot(), "the storage after the failed download");
+        checkEquals(List.of(), listNames(f.tmpDir), "tmp");
+    }
+
+    private static void wrongChunkChecksumInManifestFails(Path tempDir) throws Exception {
+        Fixture f = new Fixture(tempDir);
+        FileService service = f.service(4, ids(id(1)));
+        FileManifest stored = store(service, bytes(10, 1), null);
+        List<String> wrong = new ArrayList<>(stored.chunkSha256s());
+        wrong.set(0, sha256("not chunk 0".getBytes(StandardCharsets.US_ASCII)));
+        FileManifest tampered = new FileManifest(stored.fileId(), stored.size(), stored.sha256(), stored.chunkSize(),
+                stored.chunkCount(), wrong);
+        Files.writeString(f.manifestsDir.resolve(id(1) + ".manifest"), tampered.toText());
+
+        FileServiceException e = expectThrows(FileServiceException.class, () -> downloadBytes(service, id(1)));
+        checkEquals(FileServiceException.Reason.INTEGRITY_CHECK_FAILED, e.reason(), "the reason");
+        checkContains(e.getMessage(), "chunk 0 (" + id(1) + "_0)");
+        checkEquals(3, f.storedChunkFiles(), "chunk files on the nodes");
+    }
+
+    private static void legacyManifestIsCheckedAsWholeFile(Path tempDir) throws Exception {
+        Fixture f = new Fixture(tempDir);
+        FileService service = f.service(4, ids(id(1)));
+        byte[] data = bytes(10, 1);
+        FileManifest stored = store(service, data, null);
+        FileManifest legacy = new FileManifest(stored.fileId(), stored.size(), stored.sha256(), stored.chunkSize(),
+                stored.chunkCount());
+        Files.writeString(f.manifestsDir.resolve(id(1) + ".manifest"), legacy.toText());
+        checkEquals(legacy, f.manifests.read(id(1)).orElseThrow(), "the format 1 manifest as read");
+        check(!f.manifests.read(id(1)).orElseThrow().hasChunkChecksums(), "a format 1 manifest has no chunk checksums");
+
+        check(Arrays.equals(data, downloadBytes(service, id(1))), "the format 1 file is served");
+
+        Path damaged = f.chunkFile(id(1) + "_1");
+        byte[] content = Files.readAllBytes(damaged);
+        content[0] ^= 1;
+        Files.write(damaged, content);
+        FileServiceException e = expectThrows(FileServiceException.class, () -> downloadBytes(service, id(1)));
+        checkEquals(FileServiceException.Reason.INTEGRITY_CHECK_FAILED, e.reason(), "the reason");
+        checkContains(e.getMessage(), "was rebuilt with"); // the whole-file check, not a chunk check
+    }
+
+    private static void tooManyChunksStoresNothing(Path tempDir) throws Exception {
+        Fixture f = new Fixture(tempDir);
+        FileService service = f.service(1, ids(id(1)));
+        byte[] data = bytes(FileManifest.MAX_CHECKSUMMED_CHUNKS + 1, 1); // one chunk per byte
+
+        FileServiceException e = expectThrows(FileServiceException.class, () -> store(service, data, null));
+        checkEquals(FileServiceException.Reason.TOO_MANY_CHUNKS, e.reason(), "the reason");
+        f.checkNothingStored();
+        checkEquals(List.of(), listNames(f.tmpDir), "tmp");
+    }
+
     private static void downloadFailureReasons(Path tempDir) throws Exception {
         Fixture f = new Fixture(tempDir);
         FileService service = f.service(4, ids(id(1), id(2), id(3), id(4), id(5)));
@@ -935,6 +1034,15 @@ public class FileServiceTest {
             data[i] = (byte) (i * 31 + seed * 7 + 1);
         }
         return data;
+    }
+
+    /** The SHA-256 of every {@code chunkSize}-byte piece of {@code data}, computed independently. */
+    private static List<String> chunkSha256s(byte[] data, int chunkSize) {
+        List<String> sums = new ArrayList<>();
+        for (int offset = 0; offset < data.length; offset += chunkSize) {
+            sums.add(sha256(Arrays.copyOfRange(data, offset, Math.min(data.length, offset + chunkSize))));
+        }
+        return sums;
     }
 
     private static String sha256(byte[] data) {

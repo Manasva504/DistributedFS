@@ -638,6 +638,8 @@ class FileApiHandler implements HttpHandler {
     private static ApiError errorFor(FileServiceException.Reason reason) {
         return switch (reason) {
             case CHECKSUM_MISMATCH -> ApiError.CHECKSUM_MISMATCH;
+            // The upload is larger than this server's chunk size and manifest format allow.
+            case TOO_MANY_CHUNKS -> ApiError.PAYLOAD_TOO_LARGE;
             case FILE_NOT_FOUND -> ApiError.FILE_NOT_FOUND;
             case METADATA_CORRUPT -> ApiError.METADATA_CORRUPT;
             case CHUNK_MISSING -> ApiError.CHUNK_MISSING;

@@ -70,6 +70,10 @@ public class StartupRecoveryTest {
                 StartupRecoveryTest::incompleteUploadIsRolledBack);
         runTest("a committed upload with a leftover marker loses only the marker; the file reads back identically",
                 StartupRecoveryTest::committedUploadKeepsFile);
+        runTest("a committed format 1 upload (no chunk checksums) with a leftover marker loses only the marker",
+                StartupRecoveryTest::committedFormat1UploadKeepsFile);
+        runTest("recovery leaves a committed file with a damaged chunk in place; the download names the damage",
+                StartupRecoveryTest::damagedChunkIsLeftForDownloadToReport);
         runTest("extra chunks of a verified committed upload are kept, reported, and do not block the marker delete",
                 StartupRecoveryTest::committedExtraChunksAreReportOnly);
         runTest("rollback touches only the marker's own chunks: other files, demo chunks and orphans stay",
@@ -179,6 +183,56 @@ public class StartupRecoveryTest {
         checkEquals(manifestBefore, Files.readString(f.manifestsDir.resolve(F + ".manifest")), "the manifest");
         check(Arrays.equals(data, f.readBack(manifest, tempDir)), "the file reads back identically");
         checkContains(f.outText(), "1 committed, 0 rolled back");
+    }
+
+    /** Data stored before chunk checksums existed is recovered exactly like new data; recovery never rewrites a manifest. */
+    private static void committedFormat1UploadKeepsFile(Path tempDir) throws Exception {
+        Fixture f = new Fixture(tempDir);
+        byte[] data = bytes(10, 6);
+        FileManifest stored = f.storeCommitted(F, data);
+        FileManifest legacy = new FileManifest(F, stored.size(), stored.sha256(), stored.chunkSize(), stored.chunkCount());
+        Path manifestFile = f.manifestsDir.resolve(F + ".manifest");
+        Files.writeString(manifestFile, legacy.toText());
+        f.pending(F, legacy.chunkCount());
+
+        StartupRecovery.Result result = f.recover();
+
+        checkEquals(List.of(F), result.committed(), "committed");
+        checkEquals(List.of(), f.rules.deleted, "no chunk delete was attempted");
+        check(!Files.exists(f.manifestsDir.resolve(F + ".pending")), "the marker was deleted");
+        checkEquals(legacy.toText(), Files.readString(manifestFile), "the format 1 manifest is unchanged");
+        check(Arrays.equals(data, f.readBack(legacy, tempDir)), "the file reads back identically");
+    }
+
+    /**
+     * Recovery checks committed chunks by name and type, not by content (a documented limit). A
+     * damaged chunk of a committed upload therefore does not stop the start and is never deleted
+     * or "repaired"; the per-chunk checksum catches it at download and names it.
+     */
+    private static void damagedChunkIsLeftForDownloadToReport(Path tempDir) throws Exception {
+        Fixture f = new Fixture(tempDir);
+        FileManifest manifest = f.storeCommitted(F, bytes(10, 7));
+        f.pending(F, manifest.chunkCount());
+        Path damaged = f.chunkPath(F + "_2");
+        byte[] content = Files.readAllBytes(damaged);
+        content[0] ^= 1;
+        Files.write(damaged, content);
+
+        StartupRecovery.Result result = f.recover();
+
+        checkEquals(List.of(F), result.committed(), "committed (content is not checked at startup)");
+        checkEquals(List.of(), f.rules.deleted, "the damaged chunk was not deleted");
+        check(Arrays.equals(content, Files.readAllBytes(damaged)), "the damaged chunk is left exactly as it was");
+        FileService service = new FileService(f.cluster, f.manifests, f.tmpDir, CHUNK_SIZE, 1024 * 1024,
+                new PrintStream(new ByteArrayOutputStream(), true, StandardCharsets.UTF_8));
+        Path workspace = service.newDownloadWorkspace();
+        try {
+            FileServiceException e = expectThrows(FileServiceException.class, () -> service.download(F, workspace));
+            checkEquals(FileServiceException.Reason.INTEGRITY_CHECK_FAILED, e.reason(), "the download's reason");
+            checkContains(e.getMessage(), "chunk 2 (" + F + "_2)");
+        } finally {
+            service.deleteWorkspace(workspace);
+        }
     }
 
     private static void committedExtraChunksAreReportOnly(Path tempDir) throws Exception {
@@ -302,6 +356,13 @@ public class StartupRecoveryTest {
         });
         variants.put("an invalid manifest", (f, d) -> Files.writeString(f.manifestsDir.resolve(F + ".manifest"),
                 "format=1\nfileId=" + F + "\nsize=ten\n"));
+        variants.put("a format 2 manifest missing its last chunk line", (f, d) -> {
+            Path manifestFile = f.manifestsDir.resolve(F + ".manifest");
+            String text = Files.readString(manifestFile);
+            check(text.startsWith("format=2\n"), "the planted upload was stored in format 2");
+            String withoutLastLine = text.substring(0, text.lastIndexOf("chunk2.sha256="));
+            Files.writeString(manifestFile, withoutLastLine);
+        });
         runFailClosedVariants(tempDir, variants, null, fixture -> {
             fixture.storeCommitted(F, bytes(10, 5)); // chunks F_0, F_1, F_2
             fixture.pending(F, 3);

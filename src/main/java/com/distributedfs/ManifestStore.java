@@ -144,7 +144,7 @@ class ManifestStore {
     /** Reads a pending-upload marker, with the same rules as {@link #read}. */
     Optional<PendingUpload> readPending(String fileId) throws IOException {
         Path file = entryFor(fileId, PENDING_SUFFIX);
-        Optional<String> text = readSmallTextFile(file, FileManifest.MAX_TEXT_BYTES);
+        Optional<String> text = readSmallTextFile(file, PendingUpload.MAX_TEXT_BYTES);
         if (text.isEmpty()) {
             return Optional.empty();
         }
@@ -379,6 +379,9 @@ class ManifestStore {
     record PendingUpload(String fileId, int chunkCount) {
 
         private static final String[] KEYS = {"format", "fileId", "chunkCount"};
+
+        /** A marker is three short lines; anything larger than this is rejected without parsing. */
+        static final int MAX_TEXT_BYTES = 4 * 1024;
 
         /**
          * @throws NullPointerException if {@code fileId} is null

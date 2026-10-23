@@ -109,6 +109,10 @@ public class DownloadEndpointTest {
                 DownloadEndpointTest::missingChunk);
         runTest("altered or shortened chunks and a wrong manifest checksum are 500 integrity_check_failed",
                 DownloadEndpointTest::integrityFailures);
+        runTest("a damaged chunk is named in the server log, while the client gets only the fixed error body",
+                DownloadEndpointTest::damagedChunkIsNamedInTheLog);
+        runTest("a file stored before chunk checksums (format 1 manifest) still downloads byte-identically",
+                DownloadEndpointTest::legacyManifestStillDownloads);
 
         // Methods, Range and Host
         runTest("HEAD and every other method on /files/<id> are 405 with Allow: GET",
@@ -331,6 +335,42 @@ public class DownloadEndpointTest {
             checkErrorResponse(get(server, "/files/" + id), ApiError.CHUNK_MISSING, server, "missing chunk");
             checkEquals(before, snapshot(server), "the storage");
             checkEquals(200, get(server, "/files/" + intact).status(), "another file is still served");
+            checkTmpIsEmpty(server);
+        });
+    }
+
+    private static void damagedChunkIsNamedInTheLog(Path tempDir) throws Exception {
+        ByteArrayOutputStream errBytes = new ByteArrayOutputStream();
+        withServer(tempDir, 4, 4, FileApiHandler.STALL_TIMEOUT_MILLIS, errBytes, server -> {
+            String id = upload(server, bytes(10, 1));
+            Path damaged = chunkFile(server, FileIds.chunkId(id, 1));
+            byte[] content = Files.readAllBytes(damaged);
+            content[0] ^= 0x01;
+            Files.write(damaged, content);
+
+            RawResponse response = get(server, "/files/" + id);
+            checkErrorResponse(response, ApiError.INTEGRITY_CHECK_FAILED, server, "the damaged file");
+            String log = errBytes.toString(StandardCharsets.UTF_8);
+            checkContains(log, "chunk 1 (" + FileIds.chunkId(id, 1) + ")");
+            check(!response.bodyText().contains(FileIds.chunkId(id, 1)), "the chunk ID is only in the server log");
+            checkTmpIsEmpty(server);
+        });
+    }
+
+    private static void legacyManifestStillDownloads(Path tempDir) throws Exception {
+        withServer(tempDir, 4, server -> {
+            byte[] data = bytes(10, 6);
+            String id = upload(server, data);
+            Path manifestFile = server.dataRoot().resolve("manifests").resolve(id + ".manifest");
+            FileManifest stored = server.manifests().read(id).orElseThrow();
+            check(stored.hasChunkChecksums(), "a new upload is stored with chunk checksums");
+            Files.delete(manifestFile);
+            Files.writeString(manifestFile, new FileManifest(id, stored.size(), stored.sha256(), stored.chunkSize(),
+                    stored.chunkCount()).toText());
+
+            RawResponse response = get(server, "/files/" + id);
+            checkEquals(200, response.status(), "status");
+            check(Arrays.equals(data, response.body()), "the format 1 file downloads byte-identically");
             checkTmpIsEmpty(server);
         });
     }
