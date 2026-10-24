@@ -20,7 +20,13 @@ class DataDirectoryException extends IOException {
         /** Another server process (or another server in this process) holds the folder's lock. */
         IN_USE,
         /** A folder or file the server needs is a link, a junction, or the wrong kind of entry. */
-        UNSAFE_LAYOUT
+        UNSAFE_LAYOUT,
+        /**
+         * The storage nodes given do not match the data directory: other remote nodes than the
+         * ones recorded in its membership file, remote nodes for a folder that keeps its chunks
+         * in local node folders, or local nodes for a folder that uses remote ones.
+         */
+        WRONG_NODES
     }
 
     private final Reason reason;

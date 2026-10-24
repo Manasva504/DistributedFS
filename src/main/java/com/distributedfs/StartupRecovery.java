@@ -71,6 +71,13 @@ import java.util.regex.Pattern;
  * {@code G_j} can only be equal when F and G are the same file. Recovery deletes only candidates
  * of a marker's own file ID and chunk count, only while that file has no manifest, and only
  * through StorageCluster.deleteChunk, which deletes a regular file held by exactly one node.
+ *
+ * <p><b>Local and remote nodes.</b> Recovery sees the nodes as {@link ChunkStore}s, so every
+ * listing, every no-follow check and every temp sweep runs on the node itself: a local
+ * {@link StorageNode} in this process, or a node process reached through {@link RemoteStorageNode},
+ * which runs the same StorageNode code in its own folder. A node that cannot be reached cannot be
+ * listed, so recovery stops at step 1 with nothing changed, and the server does not start. Findings
+ * on a remote node name the node's address and the entry, since its folder is in another process.
  */
 final class StartupRecovery {
 
@@ -118,7 +125,7 @@ final class StartupRecovery {
                   int tempItemsRemoved, List<Finding> findings, List<String> uncheckedFiles) {
     }
 
-    private final List<StorageNode> nodes;
+    private final List<ChunkStore> nodes;
     private final StorageCluster cluster;
     private final ManifestStore manifests;
     private final Path tmpDir;
@@ -131,7 +138,7 @@ final class StartupRecovery {
      * @param manifests the manifest store
      * @param tmpDir    the folder holding request workspaces
      */
-    StartupRecovery(List<StorageNode> nodes, StorageCluster cluster, ManifestStore manifests, Path tmpDir,
+    StartupRecovery(List<? extends ChunkStore> nodes, StorageCluster cluster, ManifestStore manifests, Path tmpDir,
                     PrintStream out, PrintStream err) {
         this.nodes = List.copyOf(Objects.requireNonNull(nodes, "nodes must not be null"));
         this.cluster = Objects.requireNonNull(cluster, "cluster must not be null");
@@ -247,8 +254,11 @@ final class StartupRecovery {
         }
         List<List<String>> nodeNames = new ArrayList<>();
         List<Set<String>> nodeNameSets = new ArrayList<>();
-        for (StorageNode node : nodes) {
-            List<String> names = node.listEntryNames();
+        for (ChunkStore node : nodes) {
+            List<String> names = new ArrayList<>();
+            for (ChunkStore.Entry entry : node.listEntries()) {
+                names.add(entry.name());
+            }
             nodeNames.add(names);
             nodeNameSets.add(new HashSet<>(names));
         }
@@ -334,7 +344,7 @@ final class StartupRecovery {
                     }
                 }
                 throw new Unsafe("an unexpected entry \"" + name + "\" is in its namespace on node " + node + " ("
-                        + nodePath(node, name) + ")", null);
+                        + where(node, name) + ")", null);
             }
         }
     }
@@ -402,7 +412,7 @@ final class StartupRecovery {
         List<Integer> holders = new ArrayList<>();
         for (int node = 0; node < nodes.size(); node++) {
             try {
-                if (nodes.get(node).holdsRegularChunkFile(chunkId)) {
+                if (nodes.get(node).holdsRegularChunk(chunkId)) {
                     holders.add(node);
                 }
             } catch (IOException | RuntimeException e) {
@@ -503,7 +513,7 @@ final class StartupRecovery {
                 Snapshot now = snapshot();
                 for (Holder holder : presentCandidates(plan.fileId(), plan.marker().chunkCount(), now)) {
                     remaining.append("\n  ").append(holder.chunkId()).append(" on node ").append(holder.node())
-                            .append(" (").append(nodePath(holder.node(), holder.chunkId())).append(")");
+                            .append(" (").append(where(holder.node(), holder.chunkId())).append(")");
                 }
             } catch (IOException | RuntimeException | Unsafe e) {
                 remaining.append("\n  (the remaining chunks could not be listed: ").append(e).append(")");
@@ -548,7 +558,7 @@ final class StartupRecovery {
         }
         for (int node = 0; node < nodes.size(); node++) {
             try {
-                removed += nodes.get(node).sweepStaleTempFiles(warn);
+                removed += nodes.get(node).sweepTempFiles(warn);
             } catch (IOException | RuntimeException e) {
                 warn.accept("could not sweep stale temp files on node " + node + ": " + e);
             }
@@ -619,14 +629,15 @@ final class StartupRecovery {
         }
         Map<String, Integer> chunkCounts = new LinkedHashMap<>();
         for (int node = 0; node < nodes.size(); node++) {
-            List<String> names;
+            List<ChunkStore.Entry> entries;
             try {
-                names = nodes.get(node).listEntryNames();
+                entries = nodes.get(node).listEntries();
             } catch (IOException | RuntimeException e) {
                 err.println("Warning: the chunk scan skipped node " + node + ": its folder could not be listed: " + e);
                 continue;
             }
-            for (String name : names) {
+            for (ChunkStore.Entry entry : entries) {
+                String name = entry.name();
                 Matcher chunk = CANONICAL_CHUNK.matcher(name);
                 if (!chunk.matches()) {
                     continue;
@@ -637,7 +648,7 @@ final class StartupRecovery {
                 }
                 Path path = nodePath(node, name);
                 if (!manifestIds.contains(fileId)) {
-                    findings.add(new Finding(FindingType.ORPHAN_CHUNK, name, node, path, kindNote(path)));
+                    findings.add(new Finding(FindingType.ORPHAN_CHUNK, name, node, path, kindNote(entry.kind())));
                     continue;
                 }
                 if (uncheckedFiles.contains(fileId)) {
@@ -654,7 +665,7 @@ final class StartupRecovery {
                 }
                 if (!indexBelow(chunk.group(2), chunkCount)) {
                     String note = "manifest chunkCount " + chunkCount;
-                    String kind = kindNote(path);
+                    String kind = kindNote(entry.kind());
                     findings.add(new Finding(FindingType.UNREFERENCED_EXTRA_CHUNK, name, node, path,
                             kind == null ? note : note + ", " + kind));
                 }
@@ -676,14 +687,17 @@ final class StartupRecovery {
         return null;
     }
 
-    /** "not a regular file" for links, junctions and folders; null for a regular file. Never follows links. */
-    private static String kindNote(Path path) {
-        try {
-            BasicFileAttributes attributes = Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-            return attributes.isRegularFile() ? null : "not a regular file";
-        } catch (IOException | RuntimeException e) {
-            return "its type could not be read";
-        }
+    /**
+     * "not a regular file" for links, junctions and folders; null for a regular file. The kind
+     * comes from the node's listing, which reads it without following links (on the node itself
+     * for a remote node).
+     */
+    private static String kindNote(ChunkStore.EntryKind kind) {
+        return switch (kind) {
+            case FILE -> null;
+            case UNKNOWN -> "its type could not be read";
+            case DIRECTORY, LINK, OTHER -> "not a regular file";
+        };
     }
 
     private void printScan(List<Finding> findings, Set<String> uncheckedFiles) {
@@ -697,14 +711,22 @@ final class StartupRecovery {
                 + " file(s) could not be checked. Report only: nothing was deleted or changed.");
         for (Finding finding : findings) {
             out.println("  " + finding.type() + " " + finding.chunkId() + " node " + finding.node() + " "
-                    + finding.path() + (finding.note() == null ? "" : " (" + finding.note() + ")"));
+                    + where(finding.node(), finding.chunkId()) + (finding.note() == null ? "" : " (" + finding.note() + ")"));
         }
         for (String fileId : uncheckedFiles) {
             out.println("  UNCHECKED_FILE " + fileId + ": its manifest could not be read; its chunks were not classified");
         }
     }
 
+    /** The entry's path on a local node; null on a remote node, whose folder is in its own process. */
     private Path nodePath(int node, String name) {
-        return nodes.get(node).storageDir().resolve(name);
+        Optional<Path> folder = nodes.get(node).localDirectory();
+        return folder.isPresent() ? folder.get().resolve(name) : null;
+    }
+
+    /** Where an entry is, for messages: its path on a local node, or the remote node's address and the name. */
+    private String where(int node, String name) {
+        Path path = nodePath(node, name);
+        return path != null ? path.toString() : nodes.get(node).describe() + ", entry " + name;
     }
 }
