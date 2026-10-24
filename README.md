@@ -677,7 +677,7 @@ In detail:
 | 7 | Documentation: this README | `9b03340` |
 | 8 | HTTP API: `GET /health`, `POST /files` uploads with rollback, persistent manifests and startup recovery (`53605c4`); verified `GET /files/<fileId>` downloads (`0feb7a1`) | `53605c4`, `0feb7a1` |
 | — | Hardening: stalled request bodies and uploads no longer hold worker threads; chunk retrieval refuses links and junctions | `64ac867` |
-| 9 | Verification and integrity: GitHub Actions CI (`scripts\test.ps1`); per-chunk SHA-256 in manifests (format 2), checked on every download; storing refuses a junctioned node folder | not yet committed |
+| 9 | Verification and integrity: GitHub Actions CI (`scripts\test.ps1`); per-chunk SHA-256 in manifests (format 2), checked on every download; storing refuses a junctioned node folder | `0eec1d1`, merged in PR #3 (`5c26b34`) |
 
 \* Phases 1–5 were built before the Git repository was created, so they are all in the initial commit.
 
