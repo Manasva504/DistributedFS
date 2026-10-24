@@ -7,21 +7,28 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
- * Coordinates several {@link StorageNode}s, so callers can store and retrieve chunks by ID
- * without managing individual nodes. All file copying is done by the nodes themselves.
+ * Coordinates several storage nodes ({@link ChunkStore}s: local {@link StorageNode}s, remote
+ * {@link RemoteStorageNode}s, or a mix), so callers can store and retrieve chunks by ID without
+ * managing individual nodes. All file copying is done by the nodes themselves.
  *
  * <p><b>Nodes.</b> The caller creates the nodes and passes them in. The cluster keeps its own
  * copy of the list, which never changes; "node i" means the node at position i.
  *
  * <p><b>Placement.</b> Stores go round-robin: node 0, 1, 2, ... then back to node 0. If storing
- * on a node fails with an I/O error, the next node is tried. A failed StorageNode store never
- * leaves a chunk behind, so this cannot create a second copy.
+ * on a node fails with an I/O error that means the chunk was certainly not stored, the next node
+ * is tried: a failed StorageNode store never leaves a chunk behind, and a remote node that
+ * refused the connection or answered with an error stored nothing either. A store whose outcome
+ * is unknown ({@link AmbiguousStoreException}, for example a remote node that stopped answering
+ * after the chunk was sent) is never retried on another node, because the chunk may already be on
+ * the first one; the exception reaches the caller, which must treat the chunk as possibly stored.
  *
  * <p><b>One node per chunk ID.</b> Before storing, the cluster asks every node whether it already
- * holds the ID. If one does, the store fails with {@link FileAlreadyExistsException}. If any node
- * cannot answer, the store is refused, because the cluster cannot rule out a duplicate.
+ * holds the ID ({@link #requireUnusedOnEveryNode}). If one does, the store fails with
+ * {@link FileAlreadyExistsException}. If any node cannot answer, the store is refused, because the
+ * cluster cannot rule out a duplicate.
  *
  * <p><b>No index.</b> The cluster does not remember where chunks are; it asks the nodes every
  * time. A new cluster over the same node directories (for example after a restart) therefore
@@ -33,18 +40,18 @@ import java.util.Objects;
  * {@link ChunkNotFoundException}.
  *
  * <p><b>Deleting.</b> {@link #deleteChunk(String)} checks every node before deleting anything,
- * with a check that never follows links (see {@link StorageNode#deleteChunk}). It deletes only
+ * with a check that never follows links ({@link ChunkStore#holdsRegularChunk}). It deletes only
  * when every node answered clearly and exactly one holds the chunk; otherwise nothing is deleted.
  * It does not change the round-robin position.
  *
  * <p><b>Single-threaded.</b> A StorageCluster must be used from one thread at a time, and its
  * nodes should not be written to by anything else meanwhile. Checking every node and then storing
  * is not atomic, so two threads, two clusters sharing nodes, or a caller storing through a
- * StorageNode directly could put the same ID on two nodes.
+ * node directly could put the same ID on two nodes.
  */
 public class StorageCluster {
 
-    private final List<StorageNode> nodes;
+    private final List<ChunkStore> nodes;
 
     /** The node the next store tries first. Moves on after every successful store. */
     private int nextNodeIndex = 0;
@@ -54,9 +61,10 @@ public class StorageCluster {
      *
      * @throws NullPointerException if the list or any element is null
      * @throws IllegalArgumentException if the list is empty, the same node object is listed
-     *         twice, or two nodes use the same storage directory or one inside the other
+     *         twice, two local nodes use the same storage directory or one inside the other, or
+     *         two remote nodes have the same node ID (two addresses of one node process)
      */
-    public StorageCluster(List<StorageNode> nodes) {
+    public StorageCluster(List<? extends ChunkStore> nodes) {
         Objects.requireNonNull(nodes, "nodes must not be null");
         for (int i = 0; i < nodes.size(); i++) {
             if (nodes.get(i) == null) {
@@ -72,12 +80,20 @@ public class StorageCluster {
                     throw new IllegalArgumentException(
                             "The same StorageNode object is listed twice, as nodes " + i + " and " + j);
                 }
-                Path firstDir = nodes.get(i).storageDir();
-                Path secondDir = nodes.get(j).storageDir();
+                Optional<Path> firstDir = nodes.get(i).localDirectory();
+                Optional<Path> secondDir = nodes.get(j).localDirectory();
                 // Overlapping directories would let one node see, and damage, another node's files.
-                if (firstDir.startsWith(secondDir) || secondDir.startsWith(firstDir)) {
+                if (firstDir.isPresent() && secondDir.isPresent() && (firstDir.get().startsWith(secondDir.get())
+                        || secondDir.get().startsWith(firstDir.get()))) {
                     throw new IllegalArgumentException("Nodes " + i + " and " + j
-                            + " use overlapping storage directories: " + firstDir + " and " + secondDir);
+                            + " use overlapping storage directories: " + firstDir.get() + " and " + secondDir.get());
+                }
+                // The same for remote nodes: two addresses that reach one node process would make
+                // one stored chunk look like two copies, and a duplicate check count it twice.
+                Optional<String> firstId = nodes.get(i).nodeId();
+                if (firstId.isPresent() && firstId.equals(nodes.get(j).nodeId())) {
+                    throw new IllegalArgumentException("Nodes " + i + " and " + j
+                            + " are the same storage node (node ID " + firstId.get() + ")");
                 }
             }
         }
@@ -98,6 +114,8 @@ public class StorageCluster {
      * @throws IllegalArgumentException if the chunk ID is invalid, or the source file is missing,
      *         a directory, not a regular file, or not readable (checked before any node stores anything)
      * @throws FileAlreadyExistsException if a node already holds a chunk with this ID
+     * @throws AmbiguousStoreException if a node may or may not have stored the chunk; no other
+     *         node is tried, and the caller must treat the chunk as possibly stored on that node
      * @throws IOException if some node cannot confirm whether it holds the ID (nothing is stored),
      *         or if every node fails to store the chunk (each node's error is attached as suppressed)
      */
@@ -106,17 +124,7 @@ public class StorageCluster {
         // Check the source here, before any node is involved, so a bad source file is reported
         // as such instead of being treated as a node failure.
         validateSourceFile(sourceFile);
-
-        // Every node must confirm that the ID is unused. Node 0's check also validates the ID.
-        NodeAnswers answers = askEveryNode(chunkId);
-        if (!answers.holders.isEmpty()) {
-            throw new FileAlreadyExistsException(null, null,
-                    "Chunk \"" + chunkId + "\" already exists on node " + answers.holders.get(0));
-        }
-        if (!answers.errors.isEmpty()) {
-            throw withNodeErrors("Cannot store chunk \"" + chunkId + "\": " + describeNodes(answers.uncheckedNodes)
-                    + " could not confirm that the ID is unused", answers.errors);
-        }
+        requireUnusedOnEveryNode(chunkId);
 
         // Try each node once, starting with the next one in round-robin order.
         List<IOException> storeErrors = new ArrayList<>();
@@ -130,14 +138,44 @@ public class StorageCluster {
                 // The chunk appeared on this node after the check above. Storing it on another
                 // node would create a second copy, so stop here.
                 throw e;
+            } catch (AmbiguousStoreException e) {
+                // The chunk may be on this node now. Storing it on another node could create a
+                // second copy that nothing knows about, so stop here too.
+                for (IOException earlier : storeErrors) {
+                    e.addSuppressed(earlier);
+                }
+                throw e;
             } catch (IOException e) {
-                // A failed StorageNode store leaves no chunk behind, so trying the next node
-                // cannot create a duplicate.
+                // The chunk was certainly not stored on this node (a failed StorageNode store
+                // leaves nothing behind, and a remote node said so or was never reached), so
+                // trying the next node cannot create a duplicate.
                 storeErrors.add(e);
             }
         }
         throw withNodeErrors("No node could store chunk \"" + chunkId + "\" (tried all " + nodes.size()
                 + " nodes; each node's error is attached as suppressed)", storeErrors);
+    }
+
+    /**
+     * The duplicate check before a store: every node must confirm that it does not hold the ID.
+     * Node 0's check also validates the ID.
+     *
+     * <p>Kept as one separate step on purpose: with replication (milestone M2) this rule will
+     * change to cover the nodes that can be reached, and that change should be made here only.
+     *
+     * @throws FileAlreadyExistsException if some node holds the ID
+     * @throws IOException if some node could not confirm that the ID is unused
+     */
+    private void requireUnusedOnEveryNode(String chunkId) throws IOException {
+        NodeAnswers answers = askEveryNode(chunkId);
+        if (!answers.holders.isEmpty()) {
+            throw new FileAlreadyExistsException(null, null,
+                    "Chunk \"" + chunkId + "\" already exists on node " + answers.holders.get(0));
+        }
+        if (!answers.errors.isEmpty()) {
+            throw withNodeErrors("Cannot store chunk \"" + chunkId + "\": " + describeNodes(answers.uncheckedNodes)
+                    + " could not confirm that the ID is unused", answers.errors);
+        }
     }
 
     /**
@@ -149,7 +187,7 @@ public class StorageCluster {
      *         any node's storage directory (checked before anything is created)
      * @throws ChunkNotFoundException if every node confirms it does not hold the chunk
      * @throws IOException if the chunk cannot be located (see {@link #locateChunk}); otherwise
-     *         exactly what the holding node's {@link StorageNode#retrieveChunk} throws, for example
+     *         exactly what the holding node's {@link ChunkStore#retrieveChunk} throws, for example
      *         {@link FileAlreadyExistsException} if {@code destination} already exists
      */
     public long retrieveChunk(String chunkId, Path destination) throws IOException {
@@ -228,7 +266,7 @@ public class StorageCluster {
      * @throws IOException if some node could not be checked safely (for example its storage is
      *         unavailable, or the entry under the chunk's ID is a link, junction or directory) or
      *         more than one node holds the chunk, in which cases nothing is deleted; or exactly
-     *         what the holding node's {@link StorageNode#deleteChunk} throws
+     *         what the holding node's {@link ChunkStore#deleteChunk} throws
      */
     public boolean deleteChunk(String chunkId) throws IOException {
         Objects.requireNonNull(chunkId, "chunkId must not be null");
@@ -275,14 +313,14 @@ public class StorageCluster {
 
     /**
      * Like {@link #askEveryNode}, but with the no-follow question deleting needs
-     * ({@link StorageNode#holdsRegularChunkFile}). An invalid ID is rejected by node 0 with
+     * ({@link ChunkStore#holdsRegularChunk}). An invalid ID is rejected by node 0 with
      * IllegalArgumentException before any file is read.
      */
     private NodeAnswers askEveryNodeForDeletion(String chunkId) {
         NodeAnswers answers = new NodeAnswers();
         for (int i = 0; i < nodes.size(); i++) {
             try {
-                if (nodes.get(i).holdsRegularChunkFile(chunkId)) {
+                if (nodes.get(i).holdsRegularChunk(chunkId)) {
                     answers.holders.add(i);
                 }
             } catch (IOException e) {
@@ -303,11 +341,16 @@ public class StorageCluster {
      * node that holds the chunk: a copy written into another node's directory could later be
      * mistaken for a chunk stored there. Like StorageNode's own check, this compares normalized
      * paths as text, so symbolic links, junctions and Windows short names are not resolved.
+     * Remote nodes keep their folders in their own processes and are not checked.
      */
     private void requireOutsideEveryNode(Path destination) {
         Path normalizedDestination = destination.toAbsolutePath().normalize();
         for (int i = 0; i < nodes.size(); i++) {
-            Path nodeDir = nodes.get(i).storageDir();
+            Optional<Path> localDir = nodes.get(i).localDirectory();
+            if (localDir.isEmpty()) {
+                continue;
+            }
+            Path nodeDir = localDir.get();
             if (normalizedDestination.startsWith(nodeDir)) {
                 throw new IllegalArgumentException("Destination must be outside every node's storage directory,"
                         + " but is inside node " + i + "'s (" + nodeDir + "): " + destination);

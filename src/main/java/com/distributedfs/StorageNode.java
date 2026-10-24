@@ -1,5 +1,6 @@
 package com.distributedfs;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -11,10 +12,14 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
@@ -56,6 +61,11 @@ import java.util.regex.Pattern;
  * never written through a link or junction, and a file behind one is never reported as a
  * duplicate chunk; its existence check, like {@link #hasChunk}, still follows links.
  *
+ * <p><b>As a {@link ChunkStore}.</b> This is the local implementation: the cluster uses it
+ * directly when the nodes are folders in this process, and {@link StorageNodeServer} wraps one
+ * to serve it over HTTP. The node server stores with {@link #storeChunkFrom}, which streams the
+ * bytes from the request and publishes the chunk only if their length and SHA-256 match.
+ *
  * <p><b>Assumptions and limits.</b>
  * <ul>
  *   <li>Single-threaded use: only one thread, through one StorageNode object, should write to a
@@ -69,7 +79,7 @@ import java.util.regex.Pattern;
  *       ({@link #sweepStaleTempFiles}); a node used on its own does not.</li>
  * </ul>
  */
-public class StorageNode {
+public class StorageNode implements ChunkStore {
 
     /** Size of the reusable copy buffer: 64 KiB, as in FileReconstructor and ChecksumService. */
     private static final int BUFFER_SIZE = 64 * 1024;
@@ -135,10 +145,81 @@ public class StorageNode {
      *         copying fails; the temp file is deleted first, so no partial chunk is ever left
      *         under {@code chunkId}
      */
+    @Override
     public long storeChunk(String chunkId, Path sourceFile) throws IOException {
         Path chunkFile = chunkFileFor(chunkId);
         validateSourceFile(sourceFile);
+        return storeNew(chunkId, chunkFile, out -> {
+            try (InputStream in = openForReading(sourceFile)) {
+                return copy(in, out);
+            }
+        });
+    }
 
+    /**
+     * Stores exactly {@code length} bytes read from {@code in} as the chunk {@code chunkId}, and
+     * publishes the chunk only if those bytes have the SHA-256 {@code expectedSha256}. Used by the
+     * node server, which streams a request body straight into the node's temp file: the chunk is
+     * never held in memory, and a body that is short, cut off or altered on the way never appears
+     * under the chunk's name. The same checks and the same temp-file-then-rename steps as
+     * {@link #storeChunk} apply. {@code in} is read but not closed.
+     *
+     * @return the number of bytes stored, always {@code length}
+     * @throws IllegalArgumentException if the chunk ID is invalid, {@code length} is negative or
+     *         {@code expectedSha256} is not 64 lowercase hexadecimal characters (nothing is written)
+     * @throws FileAlreadyExistsException if this node already holds a chunk with this ID (nothing is read)
+     * @throws EOFException if {@code in} ends before {@code length} bytes
+     * @throws ChecksumMismatchException if the bytes do not have the expected SHA-256
+     * @throws IOException if the storage is unavailable or not a plain directory, or reading or
+     *         writing fails; in every failure the temp file is deleted and no chunk appears
+     */
+    long storeChunkFrom(String chunkId, InputStream in, long length, String expectedSha256) throws IOException {
+        Path chunkFile = chunkFileFor(chunkId);
+        Objects.requireNonNull(in, "in must not be null");
+        if (length < 0) {
+            throw new IllegalArgumentException("length must not be negative, but was " + length);
+        }
+        if (!isSha256Hex(expectedSha256)) {
+            throw new IllegalArgumentException("expectedSha256 must be 64 lowercase hexadecimal characters");
+        }
+        return storeNew(chunkId, chunkFile, out -> {
+            MessageDigest digest = newSha256();
+            byte[] buffer = new byte[BUFFER_SIZE];
+            long total = 0;
+            while (total < length) {
+                int bytesRead = in.read(buffer, 0, (int) Math.min(buffer.length, length - total));
+                if (bytesRead == -1) {
+                    throw new EOFException("the data ended after " + total + " of " + length + " bytes");
+                }
+                digest.update(buffer, 0, bytesRead);
+                out.write(buffer, 0, bytesRead);
+                total += bytesRead;
+            }
+            String actual = HexFormat.of().formatHex(digest.digest());
+            if (!actual.equals(expectedSha256)) {
+                throw new ChecksumMismatchException("the data has SHA-256 " + actual + ", not the expected "
+                        + expectedSha256);
+            }
+            return total;
+        });
+    }
+
+    /** The bytes {@link #storeChunkFrom} received do not have the SHA-256 the sender gave. */
+    static final class ChecksumMismatchException extends IOException {
+        private static final long serialVersionUID = 1L;
+
+        ChecksumMismatchException(String message) {
+            super(message);
+        }
+    }
+
+    /** Writes a new chunk's bytes into its temp file and returns how many were written. */
+    private interface ChunkWriter {
+        long write(OutputStream out) throws IOException;
+    }
+
+    /** The steps every store shares, after the chunk ID and the source have been checked. */
+    private long storeNew(String chunkId, Path chunkFile, ChunkWriter writer) throws IOException {
         // Never write through a storage directory that has been replaced by a link or junction,
         // read without following links, as delete and retrieve already require. This comes before
         // the duplicate check, which follows links: otherwise a file behind such a junction would be
@@ -161,9 +242,8 @@ public class StorageNode {
         Path tempFile = Files.createTempFile(storageDir, chunkId + "-", ".tmp");
         try {
             long bytesStored;
-            try (InputStream in = openForReading(sourceFile);
-                 OutputStream out = Files.newOutputStream(tempFile)) {
-                bytesStored = copy(in, out);
+            try (OutputStream out = Files.newOutputStream(tempFile)) {
+                bytesStored = writer.write(out);
             }
             // Publish the complete copy under its real name. With no options, Files.move refuses
             // to replace an existing file (it throws FileAlreadyExistsException), so a chunk that
@@ -308,6 +388,84 @@ public class StorageNode {
         return regularChunkFileExists(chunkFileFor(chunkId));
     }
 
+    /** {@link ChunkStore}'s name for {@link #holdsRegularChunkFile}, which tests may override. */
+    @Override
+    public boolean holdsRegularChunk(String chunkId) throws IOException {
+        return holdsRegularChunkFile(chunkId);
+    }
+
+    /**
+     * Opens the chunk for reading, with the same no-follow checks as {@link #retrieveChunk}, and
+     * returns the stream and the chunk's size. The node server uses it to send a chunk without
+     * copying it first. The caller must close the stream.
+     *
+     * @throws ChunkNotFoundException if the storage directory is a plain directory with no entry under this ID
+     * @throws IOException in every case where {@link #retrieveChunk} cannot tell
+     */
+    OpenChunk openChunk(String chunkId) throws IOException {
+        Path chunkFile = chunkFileFor(chunkId);
+        if (!regularChunkFileExists(chunkFile)) {
+            throw new ChunkNotFoundException(chunkId, storageDir);
+        }
+        long size = Files.readAttributes(chunkFile, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).size();
+        return new OpenChunk(openForReading(chunkFile), size);
+    }
+
+    /** A chunk opened by {@link #openChunk}. */
+    record OpenChunk(InputStream in, long size) {
+    }
+
+    @Override
+    public List<Entry> listEntries() throws IOException {
+        List<Entry> entries = new ArrayList<>();
+        for (String name : listEntryNames()) {
+            entries.add(new Entry(name, kindOf(storageDir.resolve(name))));
+        }
+        return entries;
+    }
+
+    /** {@link ChunkStore}'s name for {@link #sweepStaleTempFiles}. */
+    @Override
+    public int sweepTempFiles(Consumer<String> warnings) throws IOException {
+        return sweepStaleTempFiles(warnings);
+    }
+
+    @Override
+    public Optional<Path> localDirectory() {
+        return Optional.of(storageDir);
+    }
+
+    /** A folder node has no ID of its own; it is identified by its folder. */
+    @Override
+    public Optional<String> nodeId() {
+        return Optional.empty();
+    }
+
+    @Override
+    public String describe() {
+        return "the node in " + storageDir;
+    }
+
+    /** An entry's kind, read without following links. */
+    private static EntryKind kindOf(Path entry) {
+        BasicFileAttributes attributes;
+        try {
+            attributes = Files.readAttributes(entry, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        } catch (IOException | RuntimeException e) {
+            return EntryKind.UNKNOWN;
+        }
+        if (attributes.isRegularFile()) {
+            return EntryKind.FILE;
+        }
+        if (attributes.isSymbolicLink()) {
+            return EntryKind.LINK;
+        }
+        if (attributes.isDirectory() && !attributes.isOther()) {
+            return EntryKind.DIRECTORY;
+        }
+        return EntryKind.OTHER; // for example a Windows junction, which Java reports as "other"
+    }
+
     /**
      * Deletes one chunk file. Used only by {@link #deleteChunk}.
      *
@@ -415,7 +573,14 @@ public class StorageNode {
         return chunkFile;
     }
 
-    private static void validateChunkId(String chunkId) {
+    /**
+     * Checks a chunk ID against the rules in the class comment. Package-private so the node server
+     * and RemoteStorageNode apply exactly the same rules before anything reaches a node.
+     *
+     * @throws NullPointerException if {@code chunkId} is null
+     * @throws IllegalArgumentException if it breaks a rule
+     */
+    static void validateChunkId(String chunkId) {
         Objects.requireNonNull(chunkId, "chunkId must not be null");
         if (chunkId.isEmpty() || chunkId.length() > MAX_CHUNK_ID_LENGTH) {
             throw new IllegalArgumentException("Chunk ID must be 1 to " + MAX_CHUNK_ID_LENGTH
@@ -436,7 +601,8 @@ public class StorageNode {
         }
     }
 
-    private static void validateSourceFile(Path sourceFile) {
+    /** The source-file checks of {@link #storeChunk}; package-private so RemoteStorageNode makes the same ones. */
+    static void validateSourceFile(Path sourceFile) {
         Objects.requireNonNull(sourceFile, "sourceFile must not be null");
         if (!Files.exists(sourceFile)) {
             throw new IllegalArgumentException("Source file does not exist: " + sourceFile);
@@ -520,6 +686,28 @@ public class StorageNode {
         if (!DataDirectory.isPlainDirectory(storageDir)) {
             throw new IOException("Storage directory is missing or is not a plain directory (it may have been"
                     + " deleted, or replaced by a file, link or junction), so it was left alone: " + storageDir);
+        }
+    }
+
+    /** Exactly 64 lowercase hexadecimal characters, the form ChecksumService writes. */
+    static boolean isSha256Hex(String value) {
+        if (value == null || value.length() != 64) {
+            return false;
+        }
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static MessageDigest newSha256() {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is not available in this JVM", e);
         }
     }
 

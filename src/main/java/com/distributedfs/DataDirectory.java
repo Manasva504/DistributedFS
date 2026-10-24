@@ -223,7 +223,7 @@ final class DataDirectory implements AutoCloseable {
      * Opens {@code server.lock} for writing, creating it if missing. It is never truncated or
      * written. An existing entry must be a regular file, and the open does not follow links.
      */
-    private static FileChannel openLockFile(Path lockFile) throws IOException {
+    static FileChannel openLockFile(Path lockFile) throws IOException {
         try {
             BasicFileAttributes attributes =
                     Files.readAttributes(lockFile, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
@@ -279,7 +279,7 @@ final class DataDirectory implements AutoCloseable {
         return leftovers;
     }
 
-    private static boolean isSmallRegularFile(Path path, long maxBytes) throws IOException {
+    static boolean isSmallRegularFile(Path path, long maxBytes) throws IOException {
         BasicFileAttributes attributes;
         try {
             attributes = Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
@@ -344,7 +344,7 @@ final class DataDirectory implements AutoCloseable {
      * Creates the folder if it is missing, then requires it to be a plain folder. An existing
      * file, link or junction under this name is refused and left as it is.
      */
-    private static void createPlainFolder(Path folder) throws IOException {
+    static void createPlainFolder(Path folder) throws IOException {
         try {
             Files.createDirectory(folder);
         } catch (FileAlreadyExistsException e) {
@@ -374,7 +374,7 @@ final class DataDirectory implements AutoCloseable {
         return List.copyOf(dirs);
     }
 
-    private static Set<String> listNames(Path folder) throws IOException {
+    static Set<String> listNames(Path folder) throws IOException {
         Set<String> names = new TreeSet<>();
         try (DirectoryStream<Path> entries = Files.newDirectoryStream(folder)) {
             for (Path entry : entries) {
@@ -401,7 +401,7 @@ final class DataDirectory implements AutoCloseable {
     }
 
     /** Best-effort removal of a temp file this call created; a failure is attached to the original error. */
-    private static void deleteAfterFailure(Path file, Throwable originalError) {
+    static void deleteAfterFailure(Path file, Throwable originalError) {
         try {
             Files.deleteIfExists(file);
         } catch (IOException cleanupError) {
@@ -409,7 +409,7 @@ final class DataDirectory implements AutoCloseable {
         }
     }
 
-    private static void closeAfterFailure(FileChannel channel, Throwable originalError) {
+    static void closeAfterFailure(FileChannel channel, Throwable originalError) {
         try {
             channel.close();
         } catch (IOException closeError) {

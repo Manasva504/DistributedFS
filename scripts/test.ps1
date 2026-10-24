@@ -38,7 +38,7 @@ Push-Location $root
 try {
     New-Item -ItemType Directory -Path $buildDir | Out-Null
     $stressSuites = @('FileReconstructorTest', 'ChecksumServiceTest', 'StorageNodeTest', 'StorageClusterTest',
-        'DistributedFsDemoTest', 'UploadEndpointTest', 'CrashRecoveryTest', 'DownloadEndpointTest')
+        'DistributedFsDemoTest', 'UploadEndpointTest', 'CrashRecoveryTest', 'DownloadEndpointTest', 'RemoteStorageNodeTest')
 
     Write-Host "== Build ($(& javac -version)) into $buildDir"
     foreach ($part in @(@{ Src = 'src\main\java'; Out = $mainOut; Cp = $null; List = 'main-sources.txt' },
