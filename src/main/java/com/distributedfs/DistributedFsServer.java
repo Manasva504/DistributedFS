@@ -23,15 +23,24 @@ import java.util.concurrent.atomic.AtomicInteger;
  * the HTTP API on 127.0.0.1.
  *
  * <p>Usage: {@code java -cp out com.distributedfs.DistributedFsServer --data-dir <folder> [--port <0-65535>]
- * [--max-upload-mb <1-1024>]} (port 8080 by default; 0 picks any free port and prints it; uploads
- * up to 100 MiB by default). Stop it with Ctrl+C.
+ * [--max-upload-mb <1-1024>] [--node 127.0.0.1:<port> ...]} (port 8080 by default; 0 picks any free
+ * port and prints it; uploads up to 100 MiB by default). Stop it with Ctrl+C.
+ *
+ * <p><b>Storage nodes.</b> Without {@code --node}, the server keeps its chunks in three local node
+ * folders inside its data directory, as it always has. With one to sixteen {@code --node} options,
+ * it uses storage node processes ({@link StorageNodeServer}) on those 127.0.0.1 ports instead,
+ * through {@link RemoteStorageNode}. Every node must answer its health check with a node ID, the IDs
+ * must be distinct, and they must match the data directory's membership file
+ * ({@link ClusterMembership}), which the first start in remote mode writes.
  *
  * <p><b>Startup order.</b> Nothing listens until every step has succeeded:
  * <ol>
  *   <li>Open the data directory ({@link DataDirectory#open}), which checks, initializes and locks
  *       it. If another server holds the lock, opening is retried for up to 2 seconds, because
  *       Windows releases a killed process's lock shortly after the process ends.</li>
- *   <li>Create the storage nodes, the cluster and the manifest store.</li>
+ *   <li>Create the storage nodes: the local node folders, or, in remote mode, a client per
+ *       {@code --node}, each of which must answer its health check; then check the node IDs
+ *       against the membership file. Then create the cluster and the manifest store.</li>
  *   <li>Run startup recovery ({@link StartupRecovery}): finish or undo interrupted uploads, remove
  *       stale temp files, and report unreferenced chunks. If recovery cannot establish that acting
  *       is safe, the server does not start. Then create the file service.</li>
@@ -59,7 +68,7 @@ public final class DistributedFsServer {
 
     static final String USAGE =
             "Usage: java -cp out com.distributedfs.DistributedFsServer --data-dir <folder> [--port <0-65535>]"
-                    + " [--max-upload-mb <1-1024>]";
+                    + " [--max-upload-mb <1-1024>] [--node 127.0.0.1:<port> ...]";
 
     static final int DEFAULT_MAX_UPLOAD_MB = 100;
     static final int MAX_UPLOAD_MB_LIMIT = 1024;
@@ -84,14 +93,25 @@ public final class DistributedFsServer {
      * @param lockRetryMillis how long to keep retrying a data directory that is in use, 0 or more
      * @param maxUploadBytes  the largest upload accepted, at least 1
      * @param chunkSize       the chunk size for new uploads, at least 1
+     * @param nodePorts       the 127.0.0.1 ports of remote storage nodes, distinct, at most 16;
+     *                        empty for local node folders (the default)
+     * @param remoteNodes     time and size limits for talking to remote nodes
      */
     record Config(Path dataDir, int port, int workerThreads, int queueCapacity, int stopGraceSeconds,
-                  long lockRetryMillis, PrintStream out, PrintStream err, long maxUploadBytes, int chunkSize) {
+                  long lockRetryMillis, PrintStream out, PrintStream err, long maxUploadBytes, int chunkSize,
+                  List<Integer> nodePorts, RemoteNodeConfig remoteNodes) {
 
         Config {
             Objects.requireNonNull(dataDir, "dataDir must not be null");
             Objects.requireNonNull(out, "out must not be null");
             Objects.requireNonNull(err, "err must not be null");
+            Objects.requireNonNull(remoteNodes, "remoteNodes must not be null");
+            nodePorts = List.copyOf(Objects.requireNonNull(nodePorts, "nodePorts must not be null"));
+            if (nodePorts.size() > ClusterMembership.MAX_NODES || nodePorts.stream().distinct().count() != nodePorts.size()
+                    || nodePorts.stream().anyMatch(p -> p < 1 || p > 65535)) {
+                throw new IllegalArgumentException("nodePorts must be at most " + ClusterMembership.MAX_NODES
+                        + " distinct ports from 1 to 65535");
+            }
             if (port < 0 || port > 65535) {
                 throw new IllegalArgumentException("port must be 0 to 65535, but was " + port);
             }
@@ -103,7 +123,14 @@ public final class DistributedFsServer {
             }
         }
 
-        /** The default upload limit (100 MiB) and chunk size (1 MiB). */
+        /** Local node folders, with the given upload limit and chunk size. */
+        Config(Path dataDir, int port, int workerThreads, int queueCapacity, int stopGraceSeconds,
+               long lockRetryMillis, PrintStream out, PrintStream err, long maxUploadBytes, int chunkSize) {
+            this(dataDir, port, workerThreads, queueCapacity, stopGraceSeconds, lockRetryMillis, out, err,
+                    maxUploadBytes, chunkSize, List.of(), RemoteNodeConfig.defaults());
+        }
+
+        /** Local node folders, the default upload limit (100 MiB) and chunk size (1 MiB). */
         Config(Path dataDir, int port, int workerThreads, int queueCapacity, int stopGraceSeconds,
                long lockRetryMillis, PrintStream out, PrintStream err) {
             this(dataDir, port, workerThreads, queueCapacity, stopGraceSeconds, lockRetryMillis, out, err,
@@ -111,7 +138,18 @@ public final class DistributedFsServer {
         }
 
         static Config defaults(Path dataDir, int port, long maxUploadBytes, PrintStream out, PrintStream err) {
-            return new Config(dataDir, port, 4, 64, 2, 2000, out, err, maxUploadBytes, FileChunker.DEFAULT_CHUNK_SIZE);
+            return defaults(dataDir, port, maxUploadBytes, List.of(), out, err);
+        }
+
+        static Config defaults(Path dataDir, int port, long maxUploadBytes, List<Integer> nodePorts,
+                               PrintStream out, PrintStream err) {
+            return new Config(dataDir, port, 4, 64, 2, 2000, out, err, maxUploadBytes, FileChunker.DEFAULT_CHUNK_SIZE,
+                    nodePorts, RemoteNodeConfig.defaults());
+        }
+
+        /** True if the chunks are on remote storage nodes rather than in local node folders. */
+        boolean remote() {
+            return !nodePorts.isEmpty();
         }
     }
 
@@ -120,8 +158,8 @@ public final class DistributedFsServer {
         FileApiHandler create(int port, PrintStream err, FileService files);
     }
 
-    /** What the command line asked for. */
-    record Arguments(Path dataDir, int port, int maxUploadMb) {
+    /** What the command line asked for; {@code nodePorts} is empty for local node folders. */
+    record Arguments(Path dataDir, int port, int maxUploadMb, List<Integer> nodePorts) {
     }
 
     /** A command-line mistake; the message says what is wrong. */
@@ -141,11 +179,13 @@ public final class DistributedFsServer {
     private final HttpServer httpServer;
     private final ThreadPoolExecutor executor;
     private final int port;
+    private final List<RemoteStorageNode> remoteNodes;
     private boolean stopped = false;
 
     private DistributedFsServer(Config config, DataDirectory dataDirectory, StorageCluster cluster,
                                 ManifestStore manifests, FileService files, HttpServer httpServer,
-                                ThreadPoolExecutor executor) {
+                                ThreadPoolExecutor executor, List<RemoteStorageNode> remoteNodes) {
+        this.remoteNodes = List.copyOf(remoteNodes);
         this.config = config;
         this.dataDirectory = dataDirectory;
         this.cluster = cluster;
@@ -186,7 +226,7 @@ public final class DistributedFsServer {
         DistributedFsServer server;
         try {
             server = start(Config.defaults(arguments.dataDir(), arguments.port(),
-                    arguments.maxUploadMb() * BYTES_PER_MB, out, err));
+                    arguments.maxUploadMb() * BYTES_PER_MB, arguments.nodePorts(), out, err));
         } catch (IOException | RuntimeException e) {
             err.println("Error: the server could not start: " + e.getMessage());
             for (Throwable cleanupError : e.getSuppressed()) {
@@ -201,22 +241,35 @@ public final class DistributedFsServer {
 
     /**
      * Reads {@code --data-dir <folder>} (required), {@code --port <0-65535>} (default 8080) and
-     * {@code --max-upload-mb <1-1024>} (default 100), each at most once, in any order.
+     * {@code --max-upload-mb <1-1024>} (default 100), each at most once, and {@code --node
+     * 127.0.0.1:<1-65535>} once per remote storage node (none for local node folders; at most 16,
+     * each port once), in any order.
      */
     static Arguments parseArgs(String[] args) throws UsageException {
         Path dataDir = null;
         Integer port = null;
         Integer maxUploadMb = null;
+        List<Integer> nodePorts = new ArrayList<>();
         for (int i = 0; i < args.length; i++) {
             String option = args[i];
-            if (!option.equals("--data-dir") && !option.equals("--port") && !option.equals("--max-upload-mb")) {
+            if (!option.equals("--data-dir") && !option.equals("--port") && !option.equals("--max-upload-mb")
+                    && !option.equals("--node")) {
                 throw new UsageException("unknown argument: " + option);
             }
             if (i + 1 >= args.length) {
                 throw new UsageException(option + " needs a value");
             }
             String value = args[++i];
-            if (option.equals("--data-dir")) {
+            if (option.equals("--node")) {
+                int nodePort = parseNode(value);
+                if (nodePorts.contains(nodePort)) {
+                    throw new UsageException("--node 127.0.0.1:" + nodePort + " given more than once");
+                }
+                if (nodePorts.size() == ClusterMembership.MAX_NODES) {
+                    throw new UsageException("at most " + ClusterMembership.MAX_NODES + " --node options may be given");
+                }
+                nodePorts.add(nodePort);
+            } else if (option.equals("--data-dir")) {
                 if (dataDir != null) {
                     throw new UsageException("--data-dir given more than once");
                 }
@@ -244,7 +297,25 @@ public final class DistributedFsServer {
             throw new UsageException("--data-dir is required");
         }
         return new Arguments(dataDir, port == null ? DEFAULT_PORT : port,
-                maxUploadMb == null ? DEFAULT_MAX_UPLOAD_MB : maxUploadMb);
+                maxUploadMb == null ? DEFAULT_MAX_UPLOAD_MB : maxUploadMb, List.copyOf(nodePorts));
+    }
+
+    /**
+     * {@code 127.0.0.1:<port>} exactly, with the port as plain digits from 1 to 65535 without
+     * leading zeros. Storage nodes listen on 127.0.0.1 only, so no other host is accepted.
+     */
+    private static int parseNode(String value) throws UsageException {
+        String prefix = "127.0.0.1:";
+        String portText = value.startsWith(prefix) ? value.substring(prefix.length()) : "";
+        boolean digitsOnly = !portText.isEmpty() && portText.length() <= 5 && portText.charAt(0) != '0';
+        for (int i = 0; i < portText.length() && digitsOnly; i++) {
+            digitsOnly = portText.charAt(i) >= '0' && portText.charAt(i) <= '9';
+        }
+        if (!digitsOnly || Integer.parseInt(portText) > 65535) {
+            throw new UsageException("--node must be 127.0.0.1:<port> with a port from 1 to 65535 without leading"
+                    + " zeros, but was \"" + value + "\"");
+        }
+        return Integer.parseInt(portText);
     }
 
     /** Plain decimal digits, no sign and no leading zeros, 1 to 1024. */
@@ -297,10 +368,25 @@ public final class DistributedFsServer {
         DataDirectory dataDirectory = openDataDirectory(config);
         HttpServer httpServer = null;
         ThreadPoolExecutor executor = null;
+        List<RemoteStorageNode> remoteNodes = new ArrayList<>();
         try {
-            List<StorageNode> nodes = new ArrayList<>();
-            for (Path nodeDir : dataDirectory.nodeDirs()) {
-                nodes.add(new StorageNode(nodeDir));
+            List<ChunkStore> nodes = new ArrayList<>();
+            if (config.remote()) {
+                remoteNodes.addAll(connectNodes(config));
+                List<String> ids = new ArrayList<>();
+                for (RemoteStorageNode node : remoteNodes) {
+                    ids.add(node.nodeId().orElseThrow());
+                }
+                if (ClusterMembership.requireRemoteMembers(dataDirectory.root(), dataDirectory.nodeDirs(), ids)) {
+                    config.out().println("Recorded the " + ids.size() + " storage node" + (ids.size() == 1 ? "" : "s")
+                            + " of this data directory in " + ClusterMembership.FILE_NAME);
+                }
+                nodes.addAll(remoteNodes);
+            } else {
+                ClusterMembership.requireLocalMode(dataDirectory.root());
+                for (Path nodeDir : dataDirectory.nodeDirs()) {
+                    nodes.add(new StorageNode(nodeDir));
+                }
             }
             StorageCluster cluster = new StorageCluster(nodes);
             ManifestStore manifests = new ManifestStore(dataDirectory.manifestsDir());
@@ -316,16 +402,58 @@ public final class DistributedFsServer {
             httpServer.start();
 
             DistributedFsServer server = new DistributedFsServer(config, dataDirectory, cluster, manifests,
-                    files, httpServer, executor);
+                    files, httpServer, executor, remoteNodes);
             if (dataDirectory.newlyInitialized()) {
                 config.out().println("Initialized a new data directory: " + dataDirectory.root());
+            }
+            for (int i = 0; i < remoteNodes.size(); i++) {
+                config.out().println("Node " + i + ": " + remoteNodes.get(i).describe());
             }
             config.out().println("DistributedFS server listening on http://127.0.0.1:" + actualPort
                     + "/ (data directory: " + dataDirectory.root() + ")");
             return server;
         } catch (Throwable e) {
             shutDown(httpServer, executor, dataDirectory, 0, config.err(), e);
+            closeAll(remoteNodes);
             throw e;
+        }
+    }
+
+    /**
+     * One client per {@code --node}, each pinned to the node ID its health check answered. Every
+     * node must answer, and no two may be the same node (two ports of one process, which cannot
+     * happen today, or two clients that reach the same node through a proxy).
+     */
+    private static List<RemoteStorageNode> connectNodes(Config config) throws IOException {
+        List<RemoteStorageNode> connected = new ArrayList<>();
+        try {
+            for (int nodePort : config.nodePorts()) {
+                RemoteStorageNode node;
+                try {
+                    node = RemoteStorageNode.connect(nodePort, config.remoteNodes());
+                } catch (IOException e) {
+                    throw new IOException("the storage node --node 127.0.0.1:" + nodePort + " did not answer: "
+                            + e.getMessage(), e);
+                }
+                for (RemoteStorageNode earlier : connected) {
+                    if (earlier.nodeId().equals(node.nodeId())) {
+                        node.close();
+                        throw new IOException("--node 127.0.0.1:" + earlier.port() + " and --node 127.0.0.1:" + nodePort
+                                + " are the same storage node (node ID " + node.nodeId().orElseThrow() + ")");
+                    }
+                }
+                connected.add(node);
+            }
+            return connected;
+        } catch (IOException | RuntimeException e) {
+            closeAll(connected);
+            throw e;
+        }
+    }
+
+    private static void closeAll(List<RemoteStorageNode> nodes) {
+        for (RemoteStorageNode node : nodes) {
+            node.close();
         }
     }
 
@@ -368,6 +496,7 @@ public final class DistributedFsServer {
         }
         stopped = true;
         shutDown(httpServer, executor, dataDirectory, config.stopGraceSeconds(), config.err(), null);
+        closeAll(remoteNodes);
         config.out().println("DistributedFS server stopped.");
     }
 

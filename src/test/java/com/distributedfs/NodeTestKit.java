@@ -229,6 +229,93 @@ final class NodeTestKit {
     }
 
     // ---------------------------------------------------------------------
+    // The main server with remote nodes
+    // ---------------------------------------------------------------------
+
+    /** Starts the DistributedFS server on port 0, with remote nodes on {@code nodePorts} (empty: local folders). */
+    static DistributedFsServer startServer(Path dataDir, List<Integer> nodePorts, Lines out, Lines err, int chunkSize)
+            throws IOException {
+        return DistributedFsServer.start(new DistributedFsServer.Config(dataDir, 0, 4, 64, 0, 0, out.stream(),
+                err.stream(), 64L * 1024 * 1024, chunkSize, nodePorts, fastConfig()));
+    }
+
+    static RawResponse upload(int port, byte[] data) throws IOException {
+        return raw(port, "POST /files HTTP/1.1\r\n" + host(port) + "\r\nContent-Type: application/octet-stream"
+                + "\r\nContent-Length: " + data.length, data);
+    }
+
+    static RawResponse download(int port, String fileId) throws IOException {
+        return raw(port, "GET /files/" + fileId + " HTTP/1.1\r\n" + host(port), null);
+    }
+
+    /** The file ID in a 201 upload response. */
+    static String fileId(RawResponse response) {
+        java.util.regex.Matcher id = Pattern.compile("\"fileId\":\"([0-9a-f]{32})\"").matcher(response.text());
+        check(response.status() == 201 && id.find(), "not a successful upload: " + response.status() + " " + response.text());
+        return id.group(1);
+    }
+
+    /**
+     * An HTTP proxy in front of one storage node, which can lose a store's answer: in
+     * {@link Mode#DROP_STORE_REPLIES} it passes a store to the node, waits for the node's complete
+     * answer (so the chunk is stored) and then resets the client's connection instead of passing
+     * the answer on. In {@link Mode#DEAD_AFTER_DROP} it does that once and then resets every later
+     * connection, as a node that became unreachable. The Host header is rewritten for the node.
+     */
+    static final class Proxy implements AutoCloseable {
+        enum Mode { PASS, DROP_STORE_REPLIES, DEAD_AFTER_DROP }
+
+        private final SocketStub stub;
+        private volatile boolean dead = false;
+        final AtomicInteger droppedStores = new AtomicInteger();
+
+        Proxy(int nodePort, Mode mode) throws IOException {
+            stub = new SocketStub(client -> {
+                Request request = readRequest(client);
+                if (dead) {
+                    reset(client);
+                    return;
+                }
+                byte[] answer = forward(nodePort, request);
+                boolean store = request.isMethod("POST") && request.head().contains(" /chunks/");
+                if (store && mode != Mode.PASS) {
+                    droppedStores.incrementAndGet();
+                    if (mode == Mode.DEAD_AFTER_DROP) {
+                        dead = true;
+                    }
+                    reset(client);
+                    return;
+                }
+                OutputStream out = client.getOutputStream();
+                out.write(answer);
+                out.flush();
+                client.close();
+            });
+        }
+
+        int port() {
+            return stub.port();
+        }
+
+        private static byte[] forward(int nodePort, Request request) throws IOException {
+            String head = request.head().replaceFirst("(?im)^host:.*$", "Host: 127.0.0.1:" + nodePort);
+            try (Socket node = new Socket(InetAddress.getLoopbackAddress(), nodePort)) {
+                node.setSoTimeout(10_000);
+                OutputStream out = node.getOutputStream();
+                out.write(head.getBytes(StandardCharsets.ISO_8859_1));
+                out.write(request.body());
+                out.flush();
+                return node.getInputStream().readAllBytes(); // the node closes every connection after one answer
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            stub.close();
+        }
+    }
+
+    // ---------------------------------------------------------------------
     // Raw HTTP
     // ---------------------------------------------------------------------
 

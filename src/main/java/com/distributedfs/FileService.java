@@ -36,7 +36,8 @@ import java.util.Optional;
  * </ol>
  * If storing a chunk fails, or writing the manifest fails and the manifest is confirmed absent,
  * the upload is rolled back: exactly the chunks this upload recorded as stored are deleted, newest
- * first. If every delete succeeds, the marker is deleted too. If any delete fails, the marker is
+ * first. A chunk whose store on a remote node had an unknown outcome counts as "maybe stored" and
+ * is rolled back too; if every node confirms it absent, there is nothing to delete. If every delete succeeds, the marker is deleted too. If any delete fails, the marker is
  * kept (so the leftover chunks stay on record for startup recovery) and the delete failures are
  * attached to the thrown exception as suppressed. A failed manifest write is never rolled back on
  * assumption: see {@link #resolveFailedCommit}.
@@ -305,13 +306,20 @@ class FileService {
         }
 
         List<String> storedChunkIds = new ArrayList<>();
+        String storing = null;
         try {
             for (int i = 0; i < chunks.size(); i++) {
-                String chunkId = FileIds.chunkId(fileId, i);
-                cluster.storeChunk(chunkId, chunks.get(i));
-                storedChunkIds.add(chunkId); // recorded only once the store has succeeded
+                storing = FileIds.chunkId(fileId, i);
+                cluster.storeChunk(storing, chunks.get(i));
+                storedChunkIds.add(storing); // recorded only once the store has succeeded
             }
         } catch (IOException | RuntimeException e) {
+            if (e instanceof AmbiguousStoreException) {
+                // A remote node may have stored this chunk without saying so. Roll it back as "maybe
+                // stored": deleting a chunk that every node confirms absent is a no-op, and if a node
+                // cannot answer, the rollback is incomplete and the marker stays for recovery.
+                storedChunkIds.add(storing);
+            }
             FileServiceException failure = storageError("upload " + fileId + " could not be stored", e);
             rollBack(fileId, storedChunkIds, failure);
             throw failure;
@@ -376,9 +384,11 @@ class FileService {
     }
 
     /**
-     * Deletes exactly the chunks this upload recorded as stored, newest first. The marker is
-     * deleted only if every chunk delete succeeded; otherwise it is kept. Every failure is
-     * attached to {@code failure} as suppressed.
+     * Deletes exactly the chunks this upload recorded as stored, newest first, including a chunk
+     * whose store had an unknown outcome ({@link AmbiguousStoreException}), which may or may not be
+     * on a node. The marker is deleted only if every chunk delete succeeded (a chunk every node
+     * confirms absent counts as done); otherwise it is kept, so startup recovery can finish the job.
+     * Every failure is attached to {@code failure} as suppressed.
      */
     private void rollBack(String fileId, List<String> storedChunkIds, FileServiceException failure) {
         boolean complete = true;
