@@ -329,7 +329,9 @@ public class DownloadEndpointTest {
         withServer(tempDir, 4, server -> {
             String id = upload(server, bytes(10, 1));
             String intact = upload(server, bytes(10, 2));
-            Files.delete(chunkFile(server, FileIds.chunkId(id, 1)));
+            for (Path copy : chunkFiles(server, FileIds.chunkId(id, 1))) {
+                Files.delete(copy); // every copy: with one left, the download would use it
+            }
             Map<String, String> before = snapshot(server);
 
             checkErrorResponse(get(server, "/files/" + id), ApiError.CHUNK_MISSING, server, "missing chunk");
@@ -343,10 +345,11 @@ public class DownloadEndpointTest {
         ByteArrayOutputStream errBytes = new ByteArrayOutputStream();
         withServer(tempDir, 4, 4, FileApiHandler.STALL_TIMEOUT_MILLIS, errBytes, server -> {
             String id = upload(server, bytes(10, 1));
-            Path damaged = chunkFile(server, FileIds.chunkId(id, 1));
-            byte[] content = Files.readAllBytes(damaged);
-            content[0] ^= 0x01;
-            Files.write(damaged, content);
+            for (Path damaged : chunkFiles(server, FileIds.chunkId(id, 1))) {
+                byte[] content = Files.readAllBytes(damaged);
+                content[0] ^= 0x01;
+                Files.write(damaged, content);
+            }
 
             RawResponse response = get(server, "/files/" + id);
             checkErrorResponse(response, ApiError.INTEGRITY_CHECK_FAILED, server, "the damaged file");
@@ -378,17 +381,22 @@ public class DownloadEndpointTest {
     private static void integrityFailures(Path tempDir) throws Exception {
         withServer(tempDir, 4, server -> {
             String flipped = upload(server, bytes(10, 1));
-            Path flippedChunk = chunkFile(server, FileIds.chunkId(flipped, 1));
-            byte[] content = Files.readAllBytes(flippedChunk);
-            content[2] ^= 0x40;
-            Files.write(flippedChunk, content);
+            // Every copy is damaged: with one intact copy left, the download would use it.
+            for (Path flippedChunk : chunkFiles(server, FileIds.chunkId(flipped, 1))) {
+                byte[] content = Files.readAllBytes(flippedChunk);
+                content[2] ^= 0x40;
+                Files.write(flippedChunk, content);
+            }
 
             String shortened = upload(server, bytes(10, 2));
-            Files.write(chunkFile(server, FileIds.chunkId(shortened, 2)), new byte[1]);
+            for (Path copy : chunkFiles(server, FileIds.chunkId(shortened, 2))) {
+                Files.write(copy, new byte[1]);
+            }
 
             String lengthened = upload(server, bytes(10, 3));
-            Path last = chunkFile(server, FileIds.chunkId(lengthened, 2));
-            Files.write(last, concat(Files.readAllBytes(last), new byte[] {7}));
+            for (Path last : chunkFiles(server, FileIds.chunkId(lengthened, 2))) {
+                Files.write(last, concat(Files.readAllBytes(last), new byte[] {7}));
+            }
 
             // A well-formed manifest whose checksum does not match its (intact) chunks.
             String wrongSum = upload(server, bytes(10, 4));
@@ -889,15 +897,17 @@ public class DownloadEndpointTest {
         return location.substring("/files/".length());
     }
 
-    /** The stored chunk file with this ID, on whichever node holds it. */
-    private static Path chunkFile(DistributedFsServer server, String chunkId) {
+    /** Every stored copy of the chunk with this ID: the server keeps 2, each on a different node. */
+    private static List<Path> chunkFiles(DistributedFsServer server, String chunkId) {
+        List<Path> copies = new ArrayList<>();
         for (int i = 0; i < 3; i++) {
             Path candidate = server.dataRoot().resolve("nodes").resolve("node-" + i).resolve(chunkId);
             if (Files.exists(candidate)) {
-                return candidate;
+                copies.add(candidate);
             }
         }
-        throw new AssertionError("no node holds " + chunkId);
+        check(copies.size() == 2, "expected 2 copies of " + chunkId + ", found " + copies);
+        return copies;
     }
 
     /** Every file under manifests and nodes, by relative path, with its SHA-256 ("DIR" for a folder). */

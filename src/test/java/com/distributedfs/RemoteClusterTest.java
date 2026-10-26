@@ -36,7 +36,7 @@ public class RemoteClusterTest {
                 RemoteClusterTest::roundRobinOverRemoteNodes);
         RUNNER.run("storing an ID that one remote node holds is refused, and no other node gets a copy",
                 RemoteClusterTest::duplicateIsRefused);
-        RUNNER.run("with one node down, stores are refused, checks cannot tell, deletes delete nothing,"
+        RUNNER.run("with one node down, stores skip it, checks cannot tell, deletes delete nothing,"
                 + " but chunks on the other nodes can still be read", RemoteClusterTest::oneNodeDown);
         RUNNER.run("a store with an unknown outcome is not retried on another node", RemoteClusterTest::ambiguousStoreIsNotRetried);
         RUNNER.run("a store that a node certainly refused moves on to the next node", RemoteClusterTest::definiteFailureFallsBack);
@@ -91,17 +91,19 @@ public class RemoteClusterTest {
             StorageCluster cluster = new StorageCluster(nodes.remotes);
             nodes.handles.get(2).close(); // node 2 stops: its port refuses connections
 
-            java.io.IOException store = expectCannotTell("store", () -> cluster.storeChunk("file_1", source));
-            checkContains(store.getMessage(), "node 2 could not confirm that the ID is unused");
-            checkEquals(List.of("file_0"), listNames(nodes.handles.get(0).chunksDir()), "node 0 after the refused store");
-            checkEquals(List.of(), listNames(nodes.handles.get(1).chunksDir()), "node 1 after the refused store");
+            // A node that cannot be reached at all is skipped by the duplicate check (milestone M2):
+            // chunk IDs are unique anyway, and the store goes to the reachable nodes.
+            StorageCluster.StoreResult stored = cluster.storeReplicated("file_1", source);
+            checkEquals(List.of(2), stored.skipped(), "skipped unreachable nodes");
+            checkEquals(List.of("file_0", "file_1"), listNames(nodes.handles.get(0).chunksDir()), "node 0 after the store");
+            checkEquals(List.of(), listNames(nodes.handles.get(1).chunksDir()), "node 1 after the store");
 
-            expectCannotTell("hasChunk of a chunk no reachable node holds", () -> cluster.hasChunk("file_1"));
-            expectCannotTell("locate of a chunk no reachable node holds", () -> cluster.locateChunk("file_1"));
-            expectCannotTell("retrieve of a chunk no reachable node holds", () -> cluster.retrieveChunk("file_1",
+            expectCannotTell("hasChunk of a chunk no reachable node holds", () -> cluster.hasChunk("file_9"));
+            expectCannotTell("locate of a chunk no reachable node holds", () -> cluster.locateChunk("file_9"));
+            expectCannotTell("retrieve of a chunk no reachable node holds", () -> cluster.retrieveChunk("file_9",
                     tempDir.resolve("copy-1")));
             expectCannotTell("delete", () -> cluster.deleteChunk("file_0"));
-            checkEquals(List.of("file_0"), listNames(nodes.handles.get(0).chunksDir()), "nothing was deleted");
+            checkEquals(List.of("file_0", "file_1"), listNames(nodes.handles.get(0).chunksDir()), "nothing was deleted");
 
             checkEquals(true, cluster.hasChunk("file_0"), "a chunk a reachable node holds");
             Path copy = tempDir.resolve("copy-0");

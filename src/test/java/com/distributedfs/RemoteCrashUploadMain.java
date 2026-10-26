@@ -19,7 +19,9 @@ import java.util.function.Consumer;
  * the K-th chunk has been stored, so no cleanup, finally block or shutdown hook runs: the data
  * directory and the nodes are left exactly as a killed server would leave them.
  *
- * <p>Usage: {@code RemoteCrashUploadMain <dataDir> <haltAfterStores> <chunkSize> <uploadBytes> <nodePort>...}
+ * <p>Usage: {@code [-Dreplicas=N] RemoteCrashUploadMain <dataDir> <haltAfterStores> <chunkSize> <uploadBytes> <nodePort>...}
+ * (each copy counts as one store, so with 2 replicas, halting after 1 store stops between the
+ * first and the second copy of chunk 0)
  *
  * <p>Exit code {@link #HALTED} means the program halted as planned; 0 means it never reached that
  * point (a test failure).
@@ -49,7 +51,8 @@ public final class RemoteCrashUploadMain {
                     }
                 }));
             }
-            StorageCluster cluster = new StorageCluster(nodes);
+            // -Dreplicas=2 stores two copies of each chunk, as the server does; the default is one.
+            StorageCluster cluster = new StorageCluster(nodes, Integer.getInteger("replicas", 1));
             ManifestStore manifests = new ManifestStore(dataDirectory.manifestsDir());
             FileService files = new FileService(cluster, manifests, dataDirectory.tmpDir(), chunkSize, 1L << 30,
                     () -> UPLOAD_ID, quiet);

@@ -5,10 +5,12 @@ import java.io.PrintStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Stores files (hashing, chunking, placing the chunks on the cluster, and recording the file's
@@ -35,9 +37,11 @@ import java.util.Optional;
  *       left in place and a warning is logged.</li>
  * </ol>
  * If storing a chunk fails, or writing the manifest fails and the manifest is confirmed absent,
- * the upload is rolled back: exactly the chunks this upload recorded as stored are deleted, newest
- * first. A chunk whose store on a remote node had an unknown outcome counts as "maybe stored" and
- * is rolled back too; if every node confirms it absent, there is nothing to delete. If every delete succeeds, the marker is deleted too. If any delete fails, the marker is
+ * the upload is rolled back: exactly the chunks this upload recorded as stored are deleted, every
+ * copy of each, newest first. A chunk is recorded once all of its copies are confirmed (the
+ * cluster's replication factor; see {@link StorageCluster}). A chunk whose store had an unknown
+ * outcome, or that got too few copies, counts as "maybe stored" and is rolled back too; if every
+ * node confirms it absent, there is nothing to delete. If every delete succeeds, the marker is deleted too. If any delete fails, the marker is
  * kept (so the leftover chunks stay on record for startup recovery) and the delete failures are
  * attached to the thrown exception as suppressed. A failed manifest write is never rolled back on
  * assumption: see {@link #resolveFailedCommit}.
@@ -45,16 +49,19 @@ import java.util.Optional;
  * <p><b>Download, step by step</b> ({@link #download}):
  * <ol>
  *   <li>Holding the lock: read the manifest, then copy the file's chunks, in order, from the
- *       cluster into the request's workspace. The manifest alone decides whether the file
+ *       cluster into the request's workspace. For each chunk the nodes are tried in turn, and the
+ *       first copy whose SHA-256 matches the manifest is kept (format 2 manifests); a node that is
+ *       down, has no copy or has a damaged one is skipped with a warning, and the download fails
+ *       only when no good copy exists. The manifest alone decides whether the file
  *       exists: it is the upload's commit point, so a pending marker without a manifest is an
  *       upload that never committed (not found), and a manifest with a leftover marker is a
  *       committed file whose marker could not be deleted (served). Because uploads write the
  *       manifest last and roll back only uploads without one, all under the same lock, a
  *       download never sees a half-stored or half-rolled-back file.</li>
- *   <li>Without the lock: check every copy against its chunk's SHA-256 in the manifest (format 2
- *       manifests; a damaged chunk is named in the error), rebuild the file from the copies,
- *       delete the copies, and check the result's size and SHA-256 against the manifest. Only a
- *       file that passes every check is returned.</li>
+ *   <li>Without the lock: rebuild the file from the checked copies, delete the copies, and check
+ *       the result's size and SHA-256 against the manifest. Only a file that passes every check is
+ *       returned, so no byte of a chunk reaches the client before that chunk (and the whole file)
+ *       has been verified.</li>
  * </ol>
  */
 class FileService {
@@ -202,15 +209,31 @@ class FileService {
         Path copiesDir = workspace.resolve("chunks");
         synchronized (storageLock) {
             manifest = readManifestForDownload(fileId);
+            // Nodes that failed for an earlier chunk of this download are tried last for the
+            // others, so a node that is down costs its time limit at most once per download.
+            Set<Integer> failedNodes = new HashSet<>();
             for (int i = 0; i < manifest.chunkCount(); i++) {
                 String chunkId = manifest.chunkId(i);
                 Path copy = copiesDir.resolve(chunkId);
+                // Format 2 manifests record each chunk's SHA-256: each copy is checked as it
+                // arrives, and a damaged one is replaced by another node's copy. Format 1 files
+                // are checked as a whole below.
+                String expected = manifest.hasChunkChecksums() ? manifest.chunkSha256s().get(i) : null;
                 try {
-                    cluster.retrieveChunk(chunkId, copy);
+                    StorageCluster.ReadResult read = cluster.retrieveVerifiedChunk(chunkId, copy, expected, failedNodes);
+                    failedNodes.addAll(read.failedNodes());
+                    for (String problem : read.problems()) {
+                        err.println("Warning: download of file " + fileId + ", chunk " + chunkId + ": " + problem
+                                + "; the copy on node " + read.node() + " was used");
+                    }
                 } catch (ChunkNotFoundException e) {
                     throw new FileServiceException(FileServiceException.Reason.CHUNK_MISSING,
                             "file " + fileId + " is committed, but every node confirms its chunk " + chunkId
                                     + " is gone", e);
+                } catch (StorageCluster.CorruptCopiesException e) {
+                    throw new FileServiceException(FileServiceException.Reason.INTEGRITY_CHECK_FAILED,
+                            "chunk " + i + " (" + chunkId + ") of file " + fileId + " has no copy with the SHA-256 its"
+                                    + " manifest records: " + e.getMessage(), e);
                 } catch (IOException | RuntimeException e) {
                     throw storageError("chunk " + chunkId + " of file " + fileId + " could not be read", e);
                 }
@@ -219,7 +242,6 @@ class FileService {
         }
 
         // The copies are this request's own; nothing below needs the lock.
-        verifyChunkCopies(manifest, copies);
         Path file = workspace.resolve("file");
         long size;
         String sha256;
@@ -243,37 +265,6 @@ class FileService {
                             + ", but its manifest says " + manifest.size() + " bytes and " + manifest.sha256(), null);
         }
         return new Download(manifest, file);
-    }
-
-    /**
-     * Checks every retrieved chunk copy against the SHA-256 its manifest records, in order, before
-     * the file is rebuilt, so a damaged chunk is found and named instead of being joined into the
-     * file. A format 1 manifest records no chunk checksums; its chunks are not checked here, and
-     * only the whole-file check after rebuilding applies.
-     *
-     * @throws FileServiceException INTEGRITY_CHECK_FAILED for the first chunk that differs, or
-     *         STORAGE_ERROR if a copy cannot be read
-     */
-    private void verifyChunkCopies(FileManifest manifest, List<Path> copies) throws FileServiceException {
-        if (!manifest.hasChunkChecksums()) {
-            return;
-        }
-        ChecksumService checksums = new ChecksumService();
-        for (int i = 0; i < copies.size(); i++) {
-            String actual;
-            try {
-                actual = checksums.calculateSha256(copies.get(i));
-            } catch (IOException | RuntimeException e) {
-                throw storageError("chunk " + manifest.chunkId(i) + " of file " + manifest.fileId()
-                        + " could not be read for verification", e);
-            }
-            String expected = manifest.chunkSha256s().get(i);
-            if (!actual.equals(expected)) {
-                throw new FileServiceException(FileServiceException.Reason.INTEGRITY_CHECK_FAILED,
-                        "chunk " + i + " (" + manifest.chunkId(i) + ") of file " + manifest.fileId() + " has SHA-256 "
-                                + actual + ", but its manifest records " + expected, null);
-            }
-        }
     }
 
     /** The manifest of a file to download. Must be called holding the storage lock. */
@@ -310,14 +301,23 @@ class FileService {
         try {
             for (int i = 0; i < chunks.size(); i++) {
                 storing = FileIds.chunkId(fileId, i);
-                cluster.storeChunk(storing, chunks.get(i));
-                storedChunkIds.add(storing); // recorded only once the store has succeeded
+                StorageCluster.StoreResult stored = cluster.storeReplicated(storing, chunks.get(i));
+                storedChunkIds.add(storing); // recorded only once every copy is confirmed
+                if (!stored.skipped().isEmpty()) {
+                    List<String> skipped = new ArrayList<>();
+                    for (int node : stored.skipped()) {
+                        skipped.add(cluster.describeNode(node));
+                    }
+                    err.println("Warning: upload " + fileId + ", chunk " + storing + ": stored on nodes " + stored.copies()
+                            + "; skipped unreachable " + String.join(", ", skipped));
+                }
             }
         } catch (IOException | RuntimeException e) {
-            if (e instanceof AmbiguousStoreException) {
-                // A remote node may have stored this chunk without saying so. Roll it back as "maybe
-                // stored": deleting a chunk that every node confirms absent is a no-op, and if a node
-                // cannot answer, the rollback is incomplete and the marker stays for recovery.
+            if (e instanceof AmbiguousStoreException || e instanceof IncompleteReplicationException) {
+                // A node may have stored this chunk without saying so, or some copies were stored
+                // but too few. Roll it back as "maybe stored": deleting removes every copy, a
+                // chunk that every node confirms absent is a no-op, and if a node cannot answer,
+                // the rollback is incomplete and the marker stays for recovery.
                 storedChunkIds.add(storing);
             }
             FileServiceException failure = storageError("upload " + fileId + " could not be stored", e);

@@ -229,6 +229,112 @@ final class NodeTestKit {
     }
 
     // ---------------------------------------------------------------------
+    // A local node whose failures a test switches on and off
+    // ---------------------------------------------------------------------
+
+    /**
+     * A local StorageNode that a test can make fail on demand: {@code down} makes every call a
+     * {@link NodeUnavailableException} (as an unreachable remote node), {@code cannotTell} makes
+     * the existence checks a plain IOException (alive, but unable to answer), {@code failStores}
+     * makes stores fail with nothing stored, and {@code loseStoreAnswers} stores the chunk and then
+     * reports an {@link AmbiguousStoreException}. It counts retrieve calls.
+     */
+    static final class ControlledNode implements ChunkStore {
+        final StorageNode node;
+        volatile boolean down;
+        volatile boolean cannotTell;
+        volatile boolean failStores;
+        volatile boolean loseStoreAnswers;
+        final AtomicInteger retrieves = new AtomicInteger();
+
+        ControlledNode(Path dir) throws IOException {
+            node = new StorageNode(dir);
+        }
+
+        Path dir() {
+            return node.localDirectory().orElseThrow();
+        }
+
+        private void requireUp() throws IOException {
+            if (down) {
+                throw new NodeUnavailableException("simulated: " + describe() + " is down", null);
+            }
+        }
+
+        private void requireAnswer() throws IOException {
+            requireUp();
+            if (cannotTell) {
+                throw new IOException("simulated: " + describe() + " cannot tell");
+            }
+        }
+
+        @Override
+        public long storeChunk(String chunkId, Path sourceFile) throws IOException {
+            requireUp();
+            if (failStores) {
+                throw new IOException("simulated: " + describe() + " stored nothing");
+            }
+            long stored = node.storeChunk(chunkId, sourceFile);
+            if (loseStoreAnswers) {
+                throw new AmbiguousStoreException("simulated: the answer of " + describe() + " was lost", null);
+            }
+            return stored;
+        }
+
+        @Override
+        public long retrieveChunk(String chunkId, Path destination) throws IOException {
+            requireUp();
+            retrieves.incrementAndGet();
+            return node.retrieveChunk(chunkId, destination);
+        }
+
+        @Override
+        public boolean hasChunk(String chunkId) throws IOException {
+            requireAnswer();
+            return node.hasChunk(chunkId);
+        }
+
+        @Override
+        public boolean holdsRegularChunk(String chunkId) throws IOException {
+            requireAnswer();
+            return node.holdsRegularChunk(chunkId);
+        }
+
+        @Override
+        public boolean deleteChunk(String chunkId) throws IOException {
+            requireUp();
+            return node.deleteChunk(chunkId);
+        }
+
+        @Override
+        public List<ChunkStore.Entry> listEntries() throws IOException {
+            requireUp();
+            return node.listEntries();
+        }
+
+        @Override
+        public int sweepTempFiles(java.util.function.Consumer<String> warnings) throws IOException {
+            requireUp();
+            return node.sweepTempFiles(warnings);
+        }
+
+        @Override
+        public java.util.Optional<Path> localDirectory() {
+            return node.localDirectory();
+        }
+
+        @Override
+        public java.util.Optional<String> nodeId() {
+            return java.util.Optional.empty();
+        }
+
+        @Override
+        public String describe() {
+            return "controlled " + node.describe();
+        }
+    }
+
+    // ---------------------------------------------------------------------
     // The main server with remote nodes
     // ---------------------------------------------------------------------
 

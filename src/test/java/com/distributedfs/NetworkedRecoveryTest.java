@@ -84,7 +84,7 @@ public class NetworkedRecoveryTest {
             try {
                 checkContains(out.text(), "1 committed");
                 checkEquals(List.of(id + ".manifest"), listNames(data.resolve("manifests")), "manifests folder");
-                checkEquals(List.of(1, 1, 1), cluster.chunkCounts(), "chunks per node");
+                checkEquals(List.of(2, 2, 2), cluster.chunkCounts(), "copies per node (3 chunks, 2 copies each)");
                 NodeTestKit.RawResponse got = download(server.port(), id);
                 checkEquals(200, got.status(), "download");
                 check(Arrays.equals(content, got.body()), "the file differs");
