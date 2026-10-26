@@ -38,7 +38,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  *   <li>Open the data directory ({@link DataDirectory#open}), which checks, initializes and locks
  *       it. If another server holds the lock, opening is retried for up to 2 seconds, because
  *       Windows releases a killed process's lock shortly after the process ends.</li>
- *   <li>Create the storage nodes: the local node folders, or, in remote mode, a client per
+ *   <li>Create the storage nodes and a cluster that keeps {@link #REPLICAS} copies of every chunk
+ *       on different nodes (one if there is only one node): the local node folders, or, in remote mode, a client per
  *       {@code --node}, each of which must answer its health check; then check the node IDs
  *       against the membership file. Then create the cluster and the manifest store.</li>
  *   <li>Run startup recovery ({@link StartupRecovery}): finish or undo interrupted uploads, remove
@@ -62,6 +63,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class DistributedFsServer {
 
     static final int DEFAULT_PORT = 8080;
+
+    /** How many copies of each chunk the server keeps, on different nodes (fewer only with fewer nodes). */
+    static final int REPLICAS = 2;
     static final int EXIT_SUCCESS = 0;
     static final int EXIT_FAILURE = 1;
     static final int EXIT_USAGE = 2;
@@ -388,7 +392,8 @@ public final class DistributedFsServer {
                     nodes.add(new StorageNode(nodeDir));
                 }
             }
-            StorageCluster cluster = new StorageCluster(nodes);
+            // Two copies of every chunk, each on a different node (one in a one-node cluster).
+            StorageCluster cluster = new StorageCluster(nodes, Math.min(REPLICAS, nodes.size()));
             ManifestStore manifests = new ManifestStore(dataDirectory.manifestsDir());
             new StartupRecovery(nodes, cluster, manifests, dataDirectory.tmpDir(), config.out(), config.err()).run();
             FileService files = new FileService(cluster, manifests, dataDirectory.tmpDir(), config.chunkSize(),
@@ -409,6 +414,8 @@ public final class DistributedFsServer {
             for (int i = 0; i < remoteNodes.size(); i++) {
                 config.out().println("Node " + i + ": " + remoteNodes.get(i).describe());
             }
+            config.out().println("Replication: " + cluster.replicas() + (cluster.replicas() == 1 ? " copy" : " copies")
+                    + " of every chunk, each on a different node");
             config.out().println("DistributedFS server listening on http://127.0.0.1:" + actualPort
                     + "/ (data directory: " + dataDirectory.root() + ")");
             return server;

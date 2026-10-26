@@ -35,11 +35,12 @@ public class RemoteServerTest {
     private static final int CHUNK = 64 * 1024;
 
     public static void main(String[] args) {
-        RUNNER.run("a file is uploaded over three node processes, spread round-robin, and downloads byte for byte",
+        RUNNER.run("a file is uploaded over three node processes, 2 copies per chunk round-robin, and downloads byte for byte",
                 RemoteServerTest::roundTripOverThreeNodes);
-        RUNNER.run("a download with a node down is 500 storage_error, never a missing chunk or file",
+        RUNNER.run("a download with a node down uses the other copies; with both holders down it is 500 storage_error",
                 RemoteServerTest::downloadWithNodeDown);
-        RUNNER.run("an upload with a node down is 500 storage_error and stores nothing", RemoteServerTest::uploadWithNodeDown);
+        RUNNER.run("an upload with a node down stores 2 copies on the others; with one node left it fails and keeps its marker",
+                RemoteServerTest::uploadWithNodeDown);
         RUNNER.run("a chunk whose store answer was lost is rolled back, and the upload is 500",
                 RemoteServerTest::lostStoreAnswerIsRolledBack);
         RUNNER.run("if the node cannot be reached for the rollback, the marker is kept and the next start cleans up",
@@ -65,7 +66,8 @@ public class RemoteServerTest {
                 NodeTestKit.RawResponse got = download(server.port(), id);
                 checkEquals(200, got.status(), "download status");
                 check(Arrays.equals(data, got.body()), "the downloaded file differs");
-                checkEquals(List.of(2, 2, 1), cluster.chunkCounts(), "chunks per node");
+                // 5 chunks, 2 copies each: (0,1), (1,2), (2,0), (0,1), (1,2).
+                checkEquals(List.of(3, 4, 3), cluster.chunkCounts(), "copies per node");
                 for (int i = 0; i < 3; i++) {
                     checkEquals(List.of(), listNames(tempDir.resolve("data").resolve("nodes").resolve("node-" + i)),
                             "local node folder " + i);
@@ -86,11 +88,18 @@ public class RemoteServerTest {
             DistributedFsServer server = startServer(tempDir.resolve("data"), cluster.ports(), new NodeTestKit.Lines(),
                     new NodeTestKit.Lines(), CHUNK);
             try {
-                String id = fileId(upload(server.port(), randomBytes(3 * CHUNK, 2)));
+                byte[] data = randomBytes(3 * CHUNK, 2);
+                String id = fileId(upload(server.port(), data));
                 cluster.nodes.get(1).close();
                 NodeTestKit.RawResponse got = download(server.port(), id);
-                checkEquals(500, got.status(), "status");
-                checkContains(got.text(), "storage_error");
+                checkEquals(200, got.status(), "status with one node down");
+                check(Arrays.equals(data, got.body()), "the file served from the other copies differs");
+
+                // Chunk 1 has its copies on nodes 1 and 2; with both down, no copy can be read.
+                cluster.nodes.get(2).close();
+                NodeTestKit.RawResponse none = download(server.port(), id);
+                checkEquals(500, none.status(), "status with both holders down");
+                checkContains(none.text(), "storage_error");
             } finally {
                 server.stop();
             }
@@ -99,16 +108,25 @@ public class RemoteServerTest {
 
     private static void uploadWithNodeDown(Path tempDir) throws Exception {
         try (Cluster cluster = Cluster.start(tempDir, 3)) {
-            DistributedFsServer server = startServer(tempDir.resolve("data"), cluster.ports(), new NodeTestKit.Lines(),
-                    new NodeTestKit.Lines(), CHUNK);
+            Path data = tempDir.resolve("data");
+            DistributedFsServer server = startServer(data, cluster.ports(), new NodeTestKit.Lines(), new NodeTestKit.Lines(),
+                    CHUNK);
             try {
                 cluster.nodes.get(2).close();
-                NodeTestKit.RawResponse response = upload(server.port(), randomBytes(3 * CHUNK, 3));
-                checkEquals(500, response.status(), "status");
+                byte[] content = randomBytes(3 * CHUNK, 3);
+                String id = fileId(upload(server.port(), content));
+                checkEquals(3, listNames(cluster.nodes.get(0).chunksDir()).size(), "copies on node 0");
+                checkEquals(3, listNames(cluster.nodes.get(1).chunksDir()).size(), "copies on node 1");
+                check(Arrays.equals(content, download(server.port(), id).body()), "the file differs");
+
+                // With only one node left, no chunk can get its two copies: the upload fails. The
+                // down nodes cannot confirm the rollback, so the marker stays for recovery.
+                cluster.nodes.get(1).close();
+                NodeTestKit.RawResponse response = upload(server.port(), randomBytes(CHUNK, 4));
+                checkEquals(500, response.status(), "status with one node left");
                 checkContains(response.text(), "storage_error");
-                checkEquals(List.of(), listNames(cluster.nodes.get(0).chunksDir()), "node 0");
-                checkEquals(List.of(), listNames(cluster.nodes.get(1).chunksDir()), "node 1");
-                checkEquals(List.of(), listNames(tempDir.resolve("data").resolve("manifests")), "no marker or manifest");
+                check(listNames(data.resolve("manifests")).stream().anyMatch(n -> n.endsWith(".pending")),
+                        "the marker of the failed upload was kept");
             } finally {
                 server.stop();
             }

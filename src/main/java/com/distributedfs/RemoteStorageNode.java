@@ -55,8 +55,8 @@ import java.util.function.Consumer;
  * <ul>
  *   <li>201 with the right byte count: stored.</li>
  *   <li>409 {@code chunk_exists}: {@link FileAlreadyExistsException}.</li>
- *   <li>The connection could not be made (refused, or connect timeout): nothing was sent, so a
- *       plain IOException, "certainly not stored".</li>
+ *   <li>The connection could not be made (refused, or connect timeout): nothing was sent, so
+ *       "certainly not stored", as a {@link NodeUnavailableException}.</li>
  *   <li>An error the node sends only when it has published nothing (400, 403, 413, 422, 500
  *       {@code store_failed}, 503): a plain IOException, "certainly not stored".</li>
  *   <li>Anything else after the connection was made (a timeout, a reset, a malformed or unknown
@@ -176,7 +176,7 @@ final class RemoteStorageNode implements ChunkStore, AutoCloseable {
             reply = send(storeClient, request, nodeId, config.maxReplyBytes(), null, config.stallTimeoutMillis());
         } catch (IOException e) {
             if (neverSent(e)) {
-                throw new IOException(describe() + " could not be reached, so chunk " + chunkId + " was not stored: " + e, e);
+                throw new NodeUnavailableException(describe() + " could not be reached, so chunk " + chunkId + " was not stored: " + e, e);
             }
             throw new AmbiguousStoreException(describe() + " gave no clear answer after chunk " + chunkId
                     + " was sent, so it may or may not be stored there: " + e, e);
@@ -374,7 +374,11 @@ final class RemoteStorageNode implements ChunkStore, AutoCloseable {
         }
     }
 
+    /** "Could not check"; a {@link NodeUnavailableException} when the connection was never made. */
     private IOException unreachable(String what, IOException cause) {
+        if (neverSent(cause)) {
+            return new NodeUnavailableException(describe() + " could not be reached to " + what + ": " + cause, cause);
+        }
         return new IOException(describe() + " could not " + what + " (no usable answer): " + cause, cause);
     }
 

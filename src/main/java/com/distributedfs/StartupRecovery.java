@@ -8,6 +8,7 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -40,16 +41,16 @@ import java.util.regex.Pattern;
  *             node answering. The only action is deleting the marker. Canonical extra chunks
  *             {@code F_k} (k &ge; chunkCount) are left alone and reported by the chunk scan.</li>
  *         <li>Incomplete: the candidates are {@code F_0 .. F_(n-1)} for the marker's chunk count n.
- *             Each one present must be a regular file on exactly one node. Every other entry in
+ *             Each one present must be a regular file on 1 to R nodes. Every other entry in
  *             F's namespace ({@code F_...}) is unsafe, except node temp files of candidates, which
- *             the temp sweep removes. The actions are deleting the present candidates, highest
- *             index first, then the marker.</li>
+ *             the temp sweep removes. The actions are deleting the present candidates (every
+ *             copy), highest index first, then the marker.</li>
  *       </ul>
  *       If any marker is unsafe, recovery stops with nothing changed: {@link UnsafeRecoveryException}.</li>
  *   <li><b>Act</b>, marker by marker. The marker is deleted last, only once every chunk delete
  *       succeeded. If an action fails, F is checked again, read-only. When that re-check shows the
  *       same understood state (same kind, same marker and manifest, every remaining chunk a regular
- *       file on exactly one node or absent, nothing unexpected), the cleanup is deferred: the marker
+ *       file on at most R nodes or absent, nothing unexpected), the cleanup is deferred: the marker
  *       is kept so the next start retries, a warning is logged, and recovery continues. Anything
  *       else stops recovery at once, and the exception says which uploads were already resolved.</li>
  *   <li><b>Sweep stale temp files</b> in the manifest folder, each node folder and the tmp folder
@@ -61,7 +62,10 @@ import java.util.regex.Pattern;
  *       manifest nor a pending marker. {@code UNREFERENCED_EXTRA_CHUNK}: the file has a readable
  *       manifest and the index is at least its chunk count. A manifest that cannot be read is
  *       reported as {@code UNCHECKED_FILE}, and its chunks are not classified. The scan never
- *       deletes or changes anything and never stops the start.</li>
+ *       deletes or changes anything and never stops the start. With replication (R &ge; 2) it
+ *       also counts the copies of every chunk of every committed file: R copies are healthy (only
+ *       counted), fewer are {@code UNDER_REPLICATED} (still readable), none is {@code LOST_CHUNK},
+ *       and more than R is {@code OVER_REPLICATED}; at most 20 lines are printed per kind.</li>
  *   <li><b>Report</b> a one-line summary when anything was done.</li>
  * </ol>
  * Nothing is printed when there was nothing to do and nothing to report.
@@ -70,7 +74,7 @@ import java.util.regex.Pattern;
  * stored as {@code F_i}, and every file ID is exactly 32 characters, so {@code F_i} and
  * {@code G_j} can only be equal when F and G are the same file. Recovery deletes only candidates
  * of a marker's own file ID and chunk count, only while that file has no manifest, and only
- * through StorageCluster.deleteChunk, which deletes a regular file held by exactly one node.
+ * through StorageCluster.deleteChunk, which deletes regular files held by at most R nodes.
  *
  * <p><b>Local and remote nodes.</b> Recovery sees the nodes as {@link ChunkStore}s, so every
  * listing, every no-follow check and every temp sweep runs on the node itself: a local
@@ -103,8 +107,17 @@ final class StartupRecovery {
         /** The chunk's file ID has neither a manifest nor a pending marker. */
         ORPHAN_CHUNK,
         /** The chunk's file has a readable manifest, and the chunk's index is at least its chunk count. */
-        UNREFERENCED_EXTRA_CHUNK
+        UNREFERENCED_EXTRA_CHUNK,
+        /** A chunk of a committed file has fewer copies than the replication factor, but at least one. */
+        UNDER_REPLICATED,
+        /** A chunk of a committed file has no copy on any node. */
+        LOST_CHUNK,
+        /** A chunk of a committed file has more copies than the replication factor. */
+        OVER_REPLICATED
     }
+
+    /** How many lines the scan prints per replication finding kind. */
+    private static final int REPLICATION_LINES = 20;
 
     /** One chunk the scan reports; {@code note} is extra detail, or null. */
     record Finding(FindingType type, String chunkId, int node, Path path, String note) {
@@ -271,8 +284,8 @@ final class StartupRecovery {
 
     private enum Kind { COMMITTED, INCOMPLETE }
 
-    /** A chunk to delete and the node that holds it. */
-    private record Holder(String chunkId, int node) {
+    /** A chunk to delete and the nodes that hold a copy of it. */
+    private record Holder(String chunkId, List<Integer> nodes) {
     }
 
     /** What recovery found for one marker and will do about it. */
@@ -349,7 +362,7 @@ final class StartupRecovery {
         }
     }
 
-    /** D3: every chunk of a committed upload must be a regular file on exactly one node. */
+    /** D3: every chunk of a committed upload must be a regular file on 1 to R nodes. */
     private void verifyCommittedChunks(String fileId, int chunkCount, Snapshot snapshot) throws Unsafe {
         for (int i = 0; i < chunkCount; i++) {
             String chunkId = FileIds.chunkId(fileId, i);
@@ -357,9 +370,8 @@ final class StartupRecovery {
             if (listed.isEmpty()) {
                 throw new Unsafe("it is committed, but its chunk " + chunkId + " is missing from every node", null);
             }
-            if (listed.size() > 1) {
-                throw new Unsafe("it is committed, but its chunk " + chunkId + " is on more than one node "
-                        + listed, null);
+            if (listed.size() > replicas()) {
+                throw new Unsafe("it is committed, but its chunk " + chunkId + " is on " + tooMany() + " " + listed, null);
             }
             List<Integer> holders = regularHolders(chunkId);
             if (!holders.equals(listed)) {
@@ -384,15 +396,15 @@ final class StartupRecovery {
         for (int index : indexes.descendingSet()) {
             String chunkId = FileIds.chunkId(fileId, index);
             List<Integer> listed = listedOn(chunkId, snapshot);
-            if (listed.size() > 1) {
-                throw new Unsafe("its chunk " + chunkId + " is on more than one node " + listed, null);
+            if (listed.size() > replicas()) {
+                throw new Unsafe("its chunk " + chunkId + " is on " + tooMany() + " " + listed, null);
             }
             List<Integer> regular = regularHolders(chunkId);
             if (!regular.equals(listed)) {
                 throw new Unsafe("its chunk " + chunkId + " changed while recovery was checking it (listed on nodes "
                         + listed + ", held as a regular file by nodes " + regular + ")", null);
             }
-            holders.add(new Holder(chunkId, listed.get(0)));
+            holders.add(new Holder(chunkId, listed));
         }
         return holders;
     }
@@ -453,7 +465,7 @@ final class StartupRecovery {
 
     private void execute(Assessment plan, Progress progress) throws ActionFailure {
         for (Holder holder : plan.chunksToDelete()) {
-            String step = "deleting chunk " + holder.chunkId() + " on node " + holder.node();
+            String step = "deleting chunk " + holder.chunkId() + " on " + onNodes(holder.nodes());
             try {
                 if (cluster.deleteChunk(holder.chunkId())) {
                     progress.deleted++;
@@ -512,8 +524,12 @@ final class StartupRecovery {
             try {
                 Snapshot now = snapshot();
                 for (Holder holder : presentCandidates(plan.fileId(), plan.marker().chunkCount(), now)) {
-                    remaining.append("\n  ").append(holder.chunkId()).append(" on node ").append(holder.node())
-                            .append(" (").append(where(holder.node(), holder.chunkId())).append(")");
+                    List<String> places = new ArrayList<>();
+                    for (int node : holder.nodes()) {
+                        places.add(where(node, holder.chunkId()));
+                    }
+                    remaining.append("\n  ").append(holder.chunkId()).append(" on ").append(onNodes(holder.nodes()))
+                            .append(" (").append(String.join(", ", places)).append(")");
                 }
             } catch (IOException | RuntimeException | Unsafe e) {
                 remaining.append("\n  (the remaining chunks could not be listed: ").append(e).append(")");
@@ -628,12 +644,15 @@ final class StartupRecovery {
             return;
         }
         Map<String, Integer> chunkCounts = new LinkedHashMap<>();
+        Map<String, List<Integer>> regularCopies = new HashMap<>();
+        boolean everyNodeListed = true;
         for (int node = 0; node < nodes.size(); node++) {
             List<ChunkStore.Entry> entries;
             try {
                 entries = nodes.get(node).listEntries();
             } catch (IOException | RuntimeException e) {
                 err.println("Warning: the chunk scan skipped node " + node + ": its folder could not be listed: " + e);
+                everyNodeListed = false;
                 continue;
             }
             for (ChunkStore.Entry entry : entries) {
@@ -641,6 +660,9 @@ final class StartupRecovery {
                 Matcher chunk = CANONICAL_CHUNK.matcher(name);
                 if (!chunk.matches()) {
                     continue;
+                }
+                if (entry.kind() == ChunkStore.EntryKind.FILE) {
+                    regularCopies.computeIfAbsent(name, k -> new ArrayList<>()).add(node);
                 }
                 String fileId = chunk.group(1);
                 if (pendingIds.contains(fileId)) {
@@ -671,6 +693,59 @@ final class StartupRecovery {
                 }
             }
         }
+        if (replicas() >= 2) {
+            if (everyNodeListed) {
+                checkReplication(manifestIds, pendingIds, chunkCounts, regularCopies, findings, uncheckedFiles);
+            } else {
+                err.println("Warning: the replication check was skipped: not every node could be listed");
+            }
+        }
+    }
+
+    /**
+     * Counts the copies (regular files only) of every chunk of every committed file, from the
+     * scan's listing of every node. R copies are healthy; fewer, none and more are findings.
+     */
+    private void checkReplication(Set<String> manifestIds, Set<String> pendingIds, Map<String, Integer> chunkCounts,
+                                  Map<String, List<Integer>> regularCopies, List<Finding> findings,
+                                  Set<String> uncheckedFiles) {
+        healthyChunks = 0;
+        for (String fileId : new TreeSet<>(manifestIds)) {
+            if (pendingIds.contains(fileId) || uncheckedFiles.contains(fileId)) {
+                continue; // a pending upload is recovery's business; an unreadable manifest is reported already
+            }
+            Integer chunkCount = chunkCounts.get(fileId);
+            if (chunkCount == null) {
+                chunkCount = readChunkCount(fileId);
+                if (chunkCount == null) {
+                    uncheckedFiles.add(fileId);
+                    continue;
+                }
+                chunkCounts.put(fileId, chunkCount);
+            }
+            for (int i = 0; i < chunkCount; i++) {
+                String chunkId = FileIds.chunkId(fileId, i);
+                List<Integer> copies = regularCopies.getOrDefault(chunkId, List.of());
+                if (copies.size() == replicas()) {
+                    healthyChunks++;
+                } else if (copies.isEmpty()) {
+                    findings.add(new Finding(FindingType.LOST_CHUNK, chunkId, -1, null, "no copy on any node"));
+                } else {
+                    FindingType type = copies.size() < replicas() ? FindingType.UNDER_REPLICATED
+                            : FindingType.OVER_REPLICATED;
+                    findings.add(new Finding(type, chunkId, copies.get(0), null, copies.size() + " of " + replicas()
+                            + " copies, on " + onNodes(copies)));
+                }
+            }
+        }
+    }
+
+    /** Healthy chunks counted by the last replication check, for the report. */
+    private int healthyChunks = 0;
+
+    private static boolean isReplicationFinding(Finding finding) {
+        return finding.type() == FindingType.UNDER_REPLICATED || finding.type() == FindingType.LOST_CHUNK
+                || finding.type() == FindingType.OVER_REPLICATED;
     }
 
     /** The manifest's chunk count, or null if it cannot be read (a warning says why). */
@@ -701,21 +776,57 @@ final class StartupRecovery {
     }
 
     private void printScan(List<Finding> findings, Set<String> uncheckedFiles) {
-        if (findings.isEmpty() && uncheckedFiles.isEmpty()) {
-            return;
+        List<Finding> scan = findings.stream().filter(f -> !isReplicationFinding(f)).toList();
+        List<Finding> replication = findings.stream().filter(StartupRecovery::isReplicationFinding).toList();
+        if (!scan.isEmpty() || !uncheckedFiles.isEmpty()) {
+            long orphans = scan.stream().filter(f -> f.type() == FindingType.ORPHAN_CHUNK).count();
+            long extras = scan.size() - orphans;
+            out.println("Chunk scan: " + scan.size() + " finding(s): " + orphans + " " + FindingType.ORPHAN_CHUNK
+                    + ", " + extras + " " + FindingType.UNREFERENCED_EXTRA_CHUNK + "; " + uncheckedFiles.size()
+                    + " file(s) could not be checked. Report only: nothing was deleted or changed.");
+            for (Finding finding : scan) {
+                out.println("  " + finding.type() + " " + finding.chunkId() + " node " + finding.node() + " "
+                        + where(finding.node(), finding.chunkId()) + (finding.note() == null ? "" : " (" + finding.note() + ")"));
+            }
+            for (String fileId : uncheckedFiles) {
+                out.println("  UNCHECKED_FILE " + fileId + ": its manifest could not be read; its chunks were not classified");
+            }
         }
-        long orphans = findings.stream().filter(f -> f.type() == FindingType.ORPHAN_CHUNK).count();
-        long extras = findings.size() - orphans;
-        out.println("Chunk scan: " + findings.size() + " finding(s): " + orphans + " " + FindingType.ORPHAN_CHUNK
-                + ", " + extras + " " + FindingType.UNREFERENCED_EXTRA_CHUNK + "; " + uncheckedFiles.size()
-                + " file(s) could not be checked. Report only: nothing was deleted or changed.");
-        for (Finding finding : findings) {
-            out.println("  " + finding.type() + " " + finding.chunkId() + " node " + finding.node() + " "
-                    + where(finding.node(), finding.chunkId()) + (finding.note() == null ? "" : " (" + finding.note() + ")"));
+        if (!replication.isEmpty()) {
+            out.println("Replication check (" + replicas() + " copies per chunk): " + healthyChunks + " chunk(s) healthy, "
+                    + count(replication, FindingType.UNDER_REPLICATED) + " " + FindingType.UNDER_REPLICATED + ", "
+                    + count(replication, FindingType.LOST_CHUNK) + " " + FindingType.LOST_CHUNK + ", "
+                    + count(replication, FindingType.OVER_REPLICATED) + " " + FindingType.OVER_REPLICATED
+                    + ". Report only: nothing was copied, deleted or changed.");
+            for (FindingType type : List.of(FindingType.UNDER_REPLICATED, FindingType.LOST_CHUNK, FindingType.OVER_REPLICATED)) {
+                List<Finding> ofType = replication.stream().filter(f -> f.type() == type).toList();
+                for (int i = 0; i < ofType.size() && i < REPLICATION_LINES; i++) {
+                    out.println("  " + type + " " + ofType.get(i).chunkId() + " (" + ofType.get(i).note() + ")");
+                }
+                if (ofType.size() > REPLICATION_LINES) {
+                    out.println("  ... and " + (ofType.size() - REPLICATION_LINES) + " more " + type);
+                }
+            }
         }
-        for (String fileId : uncheckedFiles) {
-            out.println("  UNCHECKED_FILE " + fileId + ": its manifest could not be read; its chunks were not classified");
-        }
+    }
+
+    private static long count(List<Finding> findings, FindingType type) {
+        return findings.stream().filter(f -> f.type() == type).count();
+    }
+
+    /** The cluster's replication factor: how many copies a chunk may have. */
+    private int replicas() {
+        return cluster.replicas();
+    }
+
+    /** "more than one node", or "more than 2 nodes", for messages. */
+    private String tooMany() {
+        return replicas() == 1 ? "more than one node" : "more than " + replicas() + " nodes";
+    }
+
+    /** "node 1" or "nodes [0, 2]". */
+    private static String onNodes(List<Integer> nodes) {
+        return nodes.size() == 1 ? "node " + nodes.get(0) : "nodes " + nodes;
     }
 
     /** The entry's path on a local node; null on a remote node, whose folder is in its own process. */
