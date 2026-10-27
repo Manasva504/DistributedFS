@@ -86,6 +86,15 @@ interface ChunkStore {
      */
     int sweepTempFiles(Consumer<String> warnings) throws IOException;
 
+    /**
+     * A cheap check that the node works, for the heartbeat ({@link HeartbeatMonitor}): a local
+     * node's folder is a plain folder; a remote node answers {@code /health} quickly, as itself.
+     * It reads no chunk.
+     *
+     * @throws IOException if the node does not work, cannot be reached, or is a different node
+     */
+    void checkHealth() throws IOException;
+
     /** The node's local folder, for a node in this process; empty for a remote node. */
     Optional<Path> localDirectory();
 

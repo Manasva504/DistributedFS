@@ -8,10 +8,14 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -66,6 +70,9 @@ public final class DistributedFsServer {
 
     /** How many copies of each chunk the server keeps, on different nodes (fewer only with fewer nodes). */
     static final int REPLICAS = 2;
+
+    /** How many recorded nodes must answer for the server to start without the others (fewer if there are fewer nodes). */
+    static final int MIN_NODES_TO_START = 2;
     static final int EXIT_SUCCESS = 0;
     static final int EXIT_FAILURE = 1;
     static final int EXIT_USAGE = 2;
@@ -100,10 +107,11 @@ public final class DistributedFsServer {
      * @param nodePorts       the 127.0.0.1 ports of remote storage nodes, distinct, at most 16;
      *                        empty for local node folders (the default)
      * @param remoteNodes     time and size limits for talking to remote nodes
+     * @param heartbeatMillis how often the heartbeat checks every node, at least 1 (2 seconds by default)
      */
     record Config(Path dataDir, int port, int workerThreads, int queueCapacity, int stopGraceSeconds,
                   long lockRetryMillis, PrintStream out, PrintStream err, long maxUploadBytes, int chunkSize,
-                  List<Integer> nodePorts, RemoteNodeConfig remoteNodes) {
+                  List<Integer> nodePorts, RemoteNodeConfig remoteNodes, long heartbeatMillis) {
 
         Config {
             Objects.requireNonNull(dataDir, "dataDir must not be null");
@@ -125,6 +133,17 @@ public final class DistributedFsServer {
             if (maxUploadBytes < 1 || chunkSize < 1) {
                 throw new IllegalArgumentException("invalid upload limit or chunk size");
             }
+            if (heartbeatMillis < 1) {
+                throw new IllegalArgumentException("heartbeatMillis must be at least 1");
+            }
+        }
+
+        /** The default heartbeat interval (2 seconds). */
+        Config(Path dataDir, int port, int workerThreads, int queueCapacity, int stopGraceSeconds,
+               long lockRetryMillis, PrintStream out, PrintStream err, long maxUploadBytes, int chunkSize,
+               List<Integer> nodePorts, RemoteNodeConfig remoteNodes) {
+            this(dataDir, port, workerThreads, queueCapacity, stopGraceSeconds, lockRetryMillis, out, err,
+                    maxUploadBytes, chunkSize, nodePorts, remoteNodes, HeartbeatMonitor.DEFAULT_INTERVAL_MILLIS);
         }
 
         /** Local node folders, with the given upload limit and chunk size. */
@@ -184,12 +203,15 @@ public final class DistributedFsServer {
     private final ThreadPoolExecutor executor;
     private final int port;
     private final List<RemoteStorageNode> remoteNodes;
+    private final HeartbeatMonitor monitor;
     private boolean stopped = false;
 
     private DistributedFsServer(Config config, DataDirectory dataDirectory, StorageCluster cluster,
                                 ManifestStore manifests, FileService files, HttpServer httpServer,
-                                ThreadPoolExecutor executor, List<RemoteStorageNode> remoteNodes) {
+                                ThreadPoolExecutor executor, List<RemoteStorageNode> remoteNodes,
+                                HeartbeatMonitor monitor) {
         this.remoteNodes = List.copyOf(remoteNodes);
+        this.monitor = monitor;
         this.config = config;
         this.dataDirectory = dataDirectory;
         this.cluster = cluster;
@@ -358,61 +380,80 @@ public final class DistributedFsServer {
 
     /** Starts a server with the normal request handler. */
     static DistributedFsServer start(Config config) throws IOException {
-        return start(config, FileApiHandler::new);
+        return start(config, null);
     }
 
     /**
      * Starts a server in the order described in the class comment. On failure, everything
      * already started is undone (the data directory's lock last) and the original failure is
      * thrown, with any failures from undoing attached as suppressed.
+     *
+     * @param handlerFactory null for the normal request handler, with the cluster endpoints; tests
+     *                       pass a factory for a handler with failure hooks (without the cluster endpoints)
      */
     static DistributedFsServer start(Config config, HandlerFactory handlerFactory) throws IOException {
         Objects.requireNonNull(config, "config must not be null");
-        Objects.requireNonNull(handlerFactory, "handlerFactory must not be null");
         DataDirectory dataDirectory = openDataDirectory(config);
         HttpServer httpServer = null;
         ThreadPoolExecutor executor = null;
+        HeartbeatMonitor monitor = null;
         List<RemoteStorageNode> remoteNodes = new ArrayList<>();
         try {
             List<ChunkStore> nodes = new ArrayList<>();
+            List<Boolean> answered = new ArrayList<>();
             if (config.remote()) {
-                remoteNodes.addAll(connectNodes(config));
-                List<String> ids = new ArrayList<>();
-                for (RemoteStorageNode node : remoteNodes) {
-                    ids.add(node.nodeId().orElseThrow());
-                }
-                if (ClusterMembership.requireRemoteMembers(dataDirectory.root(), dataDirectory.nodeDirs(), ids)) {
-                    config.out().println("Recorded the " + ids.size() + " storage node" + (ids.size() == 1 ? "" : "s")
-                            + " of this data directory in " + ClusterMembership.FILE_NAME);
-                }
+                Connected connected = connectNodes(config, dataDirectory);
+                remoteNodes.addAll(connected.nodes());
+                answered.addAll(connected.answered());
                 nodes.addAll(remoteNodes);
             } else {
                 ClusterMembership.requireLocalMode(dataDirectory.root());
                 for (Path nodeDir : dataDirectory.nodeDirs()) {
                     nodes.add(new StorageNode(nodeDir));
+                    answered.add(true);
+                }
+            }
+            Set<Integer> missing = new TreeSet<>();
+            for (int i = 0; i < answered.size(); i++) {
+                if (!answered.get(i)) {
+                    missing.add(i);
                 }
             }
             // Two copies of every chunk, each on a different node (one in a one-node cluster).
             StorageCluster cluster = new StorageCluster(nodes, Math.min(REPLICAS, nodes.size()));
             ManifestStore manifests = new ManifestStore(dataDirectory.manifestsDir());
-            new StartupRecovery(nodes, cluster, manifests, dataDirectory.tmpDir(), config.out(), config.err()).run();
+            new StartupRecovery(nodes, missing, cluster, manifests, dataDirectory.tmpDir(), config.out(), config.err()).run();
             FileService files = new FileService(cluster, manifests, dataDirectory.tmpDir(), config.chunkSize(),
                     config.maxUploadBytes(), config.err());
+            monitor = new HeartbeatMonitor(nodes, answered, config.heartbeatMillis(),
+                    HeartbeatMonitor.DEFAULT_FAILURES_FOR_DOWN, Clock.systemUTC(), config.err());
+            RepairService repair = new RepairService(cluster, manifests, files, dataDirectory.tmpDir(), monitor,
+                    config.err());
+            ClusterApi clusterApi = new ClusterApi(monitor, repair, cluster.replicas());
+            monitor.start();
 
             executor = newExecutor(config);
             httpServer = HttpServer.create(new InetSocketAddress(LOOPBACK, config.port()), BACKLOG);
             httpServer.setExecutor(executor);
             int actualPort = httpServer.getAddress().getPort();
-            httpServer.createContext("/", handlerFactory.create(actualPort, config.err(), files));
+            httpServer.createContext("/", handlerFactory == null
+                    ? new FileApiHandler(actualPort, config.err(), files, clusterApi)
+                    : handlerFactory.create(actualPort, config.err(), files));
             httpServer.start();
 
             DistributedFsServer server = new DistributedFsServer(config, dataDirectory, cluster, manifests,
-                    files, httpServer, executor, remoteNodes);
+                    files, httpServer, executor, remoteNodes, monitor);
             if (dataDirectory.newlyInitialized()) {
                 config.out().println("Initialized a new data directory: " + dataDirectory.root());
             }
             for (int i = 0; i < remoteNodes.size(); i++) {
-                config.out().println("Node " + i + ": " + remoteNodes.get(i).describe());
+                config.out().println("Node " + i + ": " + remoteNodes.get(i).describe()
+                        + (missing.contains(i) ? " (did not answer; the server started without it)" : ""));
+            }
+            if (!missing.isEmpty()) {
+                config.out().println("Started with " + (missing.size() == 1 ? "node " : "nodes ") + missing
+                        .toString().replaceAll("[\\[\\]]", "") + " missing. Uploads use the other nodes, and the cluster"
+                        + " status shows when it is back.");
             }
             config.out().println("Replication: " + cluster.replicas() + (cluster.replicas() == 1 ? " copy" : " copies")
                     + " of every chunk, each on a different node");
@@ -421,39 +462,99 @@ public final class DistributedFsServer {
             return server;
         } catch (Throwable e) {
             shutDown(httpServer, executor, dataDirectory, 0, config.err(), e);
+            if (monitor != null) {
+                monitor.close();
+            }
             closeAll(remoteNodes);
             throw e;
         }
     }
 
+    /** One client per {@code --node}, in order, and whether that node answered at startup. */
+    private record Connected(List<RemoteStorageNode> nodes, List<Boolean> answered) {
+    }
+
     /**
-     * One client per {@code --node}, each pinned to the node ID its health check answered. Every
-     * node must answer, and no two may be the same node (two ports of one process, which cannot
-     * happen today, or two clients that reach the same node through a proxy).
+     * One client per {@code --node}. A node that answers its health check is pinned to the ID it
+     * answered with; no two may be the same node. Then the membership check:
+     * <ul>
+     *   <li>Every node answered: exactly the recorded nodes (or, on a first start, they are recorded).</li>
+     *   <li>Some did not (a degraded start): the data directory must already record its nodes, one
+     *       {@code --node} must be given per recorded node, every node that answered must be a
+     *       recorded one, and at least {@code min(2, nodes)} must have answered. A node that did
+     *       not answer gets a client for the recorded ID nobody answered with, or, if several did
+     *       not answer, an unidentified client that the heartbeat pins once it answers.</li>
+     * </ul>
      */
-    private static List<RemoteStorageNode> connectNodes(Config config) throws IOException {
-        List<RemoteStorageNode> connected = new ArrayList<>();
+    private static Connected connectNodes(Config config, DataDirectory dataDirectory) throws IOException {
+        List<Integer> ports = config.nodePorts();
+        RemoteStorageNode[] byIndex = new RemoteStorageNode[ports.size()];
         try {
-            for (int nodePort : config.nodePorts()) {
+            IOException firstFailure = null;
+            List<String> ids = new ArrayList<>();
+            for (int i = 0; i < ports.size(); i++) {
+                int nodePort = ports.get(i);
                 RemoteStorageNode node;
                 try {
                     node = RemoteStorageNode.connect(nodePort, config.remoteNodes());
                 } catch (IOException e) {
-                    throw new IOException("the storage node --node 127.0.0.1:" + nodePort + " did not answer: "
-                            + e.getMessage(), e);
+                    IOException failure = new IOException("the storage node --node 127.0.0.1:" + nodePort
+                            + " did not answer: " + e.getMessage(), e);
+                    if (firstFailure == null) {
+                        firstFailure = failure;
+                    } else {
+                        firstFailure.addSuppressed(failure);
+                    }
+                    continue;
                 }
-                for (RemoteStorageNode earlier : connected) {
-                    if (earlier.nodeId().equals(node.nodeId())) {
+                for (RemoteStorageNode earlier : byIndex) {
+                    if (earlier != null && earlier.nodeId().equals(node.nodeId())) {
                         node.close();
                         throw new IOException("--node 127.0.0.1:" + earlier.port() + " and --node 127.0.0.1:" + nodePort
                                 + " are the same storage node (node ID " + node.nodeId().orElseThrow() + ")");
                     }
                 }
-                connected.add(node);
+                byIndex[i] = node;
+                ids.add(node.nodeId().orElseThrow());
             }
-            return connected;
+            List<Boolean> answered = new ArrayList<>();
+            for (RemoteStorageNode node : byIndex) {
+                answered.add(node != null);
+            }
+            if (firstFailure == null) {
+                if (ClusterMembership.requireRemoteMembers(dataDirectory.root(), dataDirectory.nodeDirs(), ids)) {
+                    config.out().println("Recorded the " + ids.size() + " storage node" + (ids.size() == 1 ? "" : "s")
+                            + " of this data directory in " + ClusterMembership.FILE_NAME);
+                }
+                return new Connected(List.of(byIndex), answered);
+            }
+            if (ClusterMembership.read(dataDirectory.root().resolve(ClusterMembership.FILE_NAME)).isEmpty()) {
+                throw firstFailure; // a first start needs every node, to record them
+            }
+            Set<String> unanswered = ClusterMembership.requireRecordedMembers(dataDirectory.root(), ports.size(), ids);
+            int needed = Math.min(MIN_NODES_TO_START, ports.size());
+            if (ids.size() < needed) {
+                throw new IOException("only " + ids.size() + " of the " + ports.size() + " recorded storage nodes"
+                        + " answered, and at least " + needed + " are needed to start: " + firstFailure.getMessage(),
+                        firstFailure);
+            }
+            // One set for all unidentified nodes: the first to answer with an ID claims it.
+            Set<String> unclaimed = ConcurrentHashMap.newKeySet();
+            unclaimed.addAll(unanswered);
+            for (int i = 0; i < byIndex.length; i++) {
+                if (byIndex[i] == null) {
+                    byIndex[i] = unanswered.size() == 1
+                            ? new RemoteStorageNode(ports.get(i), unanswered.iterator().next(), config.remoteNodes())
+                            : RemoteStorageNode.unidentified(ports.get(i), unclaimed, config.remoteNodes());
+                }
+            }
+            return new Connected(List.of(byIndex), answered);
         } catch (IOException | RuntimeException e) {
-            closeAll(connected);
+            for (RemoteStorageNode node : byIndex) {
+                if (node != null) {
+                    node.close();
+                }
+            }
             throw e;
         }
     }
@@ -493,6 +594,11 @@ public final class DistributedFsServer {
         return files;
     }
 
+    /** The heartbeat that tracks which nodes are UP, for tests that run a check at once. */
+    HeartbeatMonitor monitor() {
+        return monitor;
+    }
+
     /**
      * Stops the server and releases the data directory. Calling it again does nothing. Failures
      * of individual steps are logged and do not stop the later steps; the lock is released last.
@@ -503,6 +609,7 @@ public final class DistributedFsServer {
         }
         stopped = true;
         shutDown(httpServer, executor, dataDirectory, config.stopGraceSeconds(), config.err(), null);
+        monitor.close(); // before the clients it uses are closed
         closeAll(remoteNodes);
         config.out().println("DistributedFS server stopped.");
     }

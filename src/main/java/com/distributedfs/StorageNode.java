@@ -430,6 +430,12 @@ public class StorageNode implements ChunkStore {
         return sweepStaleTempFiles(warnings);
     }
 
+    /** {@inheritDoc} Here: the storage directory is a plain directory, read without following links. */
+    @Override
+    public void checkHealth() throws IOException {
+        requirePlainStorageDirectory();
+    }
+
     @Override
     public Optional<Path> localDirectory() {
         return Optional.of(storageDir);

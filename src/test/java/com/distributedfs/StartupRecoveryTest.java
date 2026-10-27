@@ -70,6 +70,10 @@ public class StartupRecoveryTest {
                 StartupRecoveryTest::incompleteUploadIsRolledBack);
         runTest("a committed upload with a leftover marker loses only the marker; the file reads back identically",
                 StartupRecoveryTest::committedUploadKeepsFile);
+        runTest("a committed upload with a chunk on two nodes is accepted and both copies are kept",
+                StartupRecoveryTest::committedDuplicateIsAccepted);
+        runTest("an incomplete upload's chunk on two nodes is deleted from both",
+                StartupRecoveryTest::incompleteDuplicateIsDeleted);
         runTest("a committed format 1 upload (no chunk checksums) with a leftover marker loses only the marker",
                 StartupRecoveryTest::committedFormat1UploadKeepsFile);
         runTest("recovery leaves a committed file with a damaged chunk in place; the download names the damage",
@@ -183,6 +187,37 @@ public class StartupRecoveryTest {
         checkEquals(manifestBefore, Files.readString(f.manifestsDir.resolve(F + ".manifest")), "the manifest");
         check(Arrays.equals(data, f.readBack(manifest, tempDir)), "the file reads back identically");
         checkContains(f.outText(), "1 committed, 0 rolled back");
+    }
+
+    /** Since milestone M3 a chunk on more nodes than the replication factor is accepted, not unsafe. */
+    private static void committedDuplicateIsAccepted(Path tempDir) throws Exception {
+        Fixture f = new Fixture(tempDir);
+        byte[] data = bytes(10, 7);
+        FileManifest manifest = f.storeCommitted(F, data);
+        int holder = f.nodeOf(F + "_1");
+        Path copy = Files.copy(f.chunkPath(F + "_1"), f.nodeDirs.get((holder + 1) % NODE_COUNT).resolve(F + "_1"));
+        f.pending(F, manifest.chunkCount());
+
+        StartupRecovery.Result result = f.recover();
+
+        checkEquals(List.of(F), result.committed(), "committed");
+        checkEquals(List.of(), f.rules.deleted, "no copy was deleted");
+        check(Files.exists(copy), "the second copy is left alone");
+        check(!Files.exists(f.manifestsDir.resolve(F + ".pending")), "the marker was deleted");
+    }
+
+    /** Since milestone M3 an interrupted upload's candidate on two nodes is deleted from both. */
+    private static void incompleteDuplicateIsDeleted(Path tempDir) throws Exception {
+        Fixture f = new Fixture(tempDir);
+        f.pending(F, 1);
+        Path first = f.putChunk(0, F + "_0", "f0");
+        Path second = f.putChunk(2, F + "_0", "copy");
+
+        StartupRecovery.Result result = f.recover();
+
+        checkEquals(List.of(F), result.rolledBack(), "rolled back");
+        check(!Files.exists(first) && !Files.exists(second), "both copies were deleted");
+        check(!Files.exists(f.manifestsDir.resolve(F + ".pending")), "the marker was deleted");
     }
 
     /** Data stored before chunk checksums existed is recovered exactly like new data; recovery never rewrites a manifest. */
@@ -337,11 +372,6 @@ public class StartupRecoveryTest {
     private static void damagedCommittedUploadsFailClosed(Path tempDir) throws Exception {
         Map<String, Variant> variants = new java.util.LinkedHashMap<>();
         variants.put("a missing chunk", (f, d) -> Files.delete(f.chunkPath(F + "_1")));
-        variants.put("a duplicated chunk", (f, d) -> {
-            Path chunk = f.chunkPath(F + "_1");
-            int holder = f.nodeOf(F + "_1");
-            Files.copy(chunk, f.nodeDirs.get((holder + 1) % NODE_COUNT).resolve(F + "_1"));
-        });
         variants.put("a junction in place of a chunk", (f, d) -> {
             Path chunk = f.chunkPath(F + "_1");
             Files.delete(chunk);
@@ -375,7 +405,6 @@ public class StartupRecoveryTest {
         variants.put("an index with a leading zero", (f, d) -> f.putChunk(1, F + "_01", "x"));
         variants.put("a non-numeric name in the namespace", (f, d) -> f.putChunk(1, F + "_x", "x"));
         variants.put("a temp file of a chunk beyond the count", (f, d) -> f.putChunk(1, F + "_5-12.tmp", "x"));
-        variants.put("a candidate on two nodes", (f, d) -> f.putChunk(2, F + "_0", "copy"));
         variants.put("a junction under a candidate's name", (f, d) -> {
             Path target = Files.createDirectories(d.resolve("target"));
             Files.writeString(target.resolve("precious"), "precious");
@@ -502,10 +531,6 @@ public class StartupRecoveryTest {
             Path target = Files.createDirectories(d.resolve("target"));
             Files.writeString(target.resolve("precious"), "precious");
             createDirectoryJunction(chunkFile, target);
-            throw new IOException("simulated delete failure");
-        });
-        cases.put("a duplicate appeared", (f, chunkFile, d) -> {
-            Files.copy(chunkFile, f.nodeDirs.get(0).resolve(chunkFile.getFileName().toString()));
             throw new IOException("simulated delete failure");
         });
         cases.put("a manifest appeared", (f, chunkFile, d) -> {

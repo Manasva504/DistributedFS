@@ -221,9 +221,29 @@ final class NodeTestKit {
     }
 
     static NodeHandle startNode(Path folder, long maxChunkBytes, long stallMillis, long lockWaitMillis) throws IOException {
+        return startNode(folder, 0, maxChunkBytes, stallMillis, lockWaitMillis, 0);
+    }
+
+    /** A node on a chosen port, for a node that comes back on its old port; the bind is retried for 5 seconds. */
+    static NodeHandle startNodeOnPort(Path folder, int port) throws IOException {
+        long deadline = System.nanoTime() + 5_000_000_000L;
+        while (true) {
+            try {
+                return startNode(folder, port, 16 * 1024 * 1024, 600, 2_000, 2_000);
+            } catch (java.net.BindException e) {
+                if (System.nanoTime() > deadline) {
+                    throw e;
+                }
+                sleepQuietly(100);
+            }
+        }
+    }
+
+    private static NodeHandle startNode(Path folder, int port, long maxChunkBytes, long stallMillis, long lockWaitMillis,
+                                        long lockRetryMillis) throws IOException {
         Lines out = new Lines();
         Lines err = new Lines();
-        StorageNodeServer server = StorageNodeServer.start(new StorageNodeServer.Config(folder, 0, 4, 16, 0, 0,
+        StorageNodeServer server = StorageNodeServer.start(new StorageNodeServer.Config(folder, port, 4, 16, 0, lockRetryMillis,
                 out.stream(), err.stream(), maxChunkBytes, stallMillis, lockWaitMillis));
         return new NodeHandle(server, out, err);
     }
@@ -245,7 +265,15 @@ final class NodeTestKit {
         volatile boolean cannotTell;
         volatile boolean failStores;
         volatile boolean loseStoreAnswers;
+        /** A health check throws an unexpected RuntimeException. */
+        volatile boolean healthBomb;
+        /** Stores succeed, but the stored copy has one byte changed. */
+        volatile boolean damageStores;
         final AtomicInteger retrieves = new AtomicInteger();
+        final AtomicInteger healthChecks = new AtomicInteger();
+        final AtomicInteger stores = new AtomicInteger();
+        /** Every storeChunk call, including those that fail. */
+        final AtomicInteger storeAttempts = new AtomicInteger();
 
         ControlledNode(Path dir) throws IOException {
             node = new StorageNode(dir);
@@ -270,11 +298,19 @@ final class NodeTestKit {
 
         @Override
         public long storeChunk(String chunkId, Path sourceFile) throws IOException {
+            storeAttempts.incrementAndGet();
             requireUp();
             if (failStores) {
                 throw new IOException("simulated: " + describe() + " stored nothing");
             }
             long stored = node.storeChunk(chunkId, sourceFile);
+            stores.incrementAndGet();
+            if (damageStores) {
+                Path copy = dir().resolve(chunkId);
+                byte[] content = Files.readAllBytes(copy);
+                content[0] ^= 1;
+                Files.write(copy, content);
+            }
             if (loseStoreAnswers) {
                 throw new AmbiguousStoreException("simulated: the answer of " + describe() + " was lost", null);
             }
@@ -319,6 +355,16 @@ final class NodeTestKit {
         }
 
         @Override
+        public void checkHealth() throws IOException {
+            healthChecks.incrementAndGet();
+            if (healthBomb) {
+                throw new IllegalStateException("simulated: a health check failed unexpectedly");
+            }
+            requireUp();
+            node.checkHealth();
+        }
+
+        @Override
         public java.util.Optional<Path> localDirectory() {
             return node.localDirectory();
         }
@@ -343,6 +389,70 @@ final class NodeTestKit {
             throws IOException {
         return DistributedFsServer.start(new DistributedFsServer.Config(dataDir, 0, 4, 64, 0, 0, out.stream(),
                 err.stream(), 64L * 1024 * 1024, chunkSize, nodePorts, fastConfig()));
+    }
+
+    /** As {@link #startServer(Path, List, Lines, Lines, int)}, with a heartbeat every {@code heartbeatMillis}. */
+    static DistributedFsServer startServer(Path dataDir, List<Integer> nodePorts, Lines out, Lines err, int chunkSize,
+                                           long heartbeatMillis) throws IOException {
+        return DistributedFsServer.start(new DistributedFsServer.Config(dataDir, 0, 4, 64, 0, 0, out.stream(),
+                err.stream(), 64L * 1024 * 1024, chunkSize, nodePorts, fastConfig(), heartbeatMillis));
+    }
+
+    static RawResponse status(int port) throws IOException {
+        return raw(port, "GET /cluster/status HTTP/1.1\r\n" + host(port), null);
+    }
+
+    /** {@code POST /cluster/repair}, with {@code query} (for example "dryRun=true") or null. */
+    static RawResponse repair(int port, String query) throws IOException {
+        return raw(port, "POST /cluster/repair" + (query == null ? "" : "?" + query) + " HTTP/1.1\r\n" + host(port)
+                + "\r\nContent-Length: 0", null);
+    }
+
+    /** The number after {@code "key":} in a JSON text; fails the test if it is not there. */
+    static long jsonNumber(String json, String key) {
+        java.util.regex.Matcher m = Pattern.compile("\"" + Pattern.quote(key) + "\":(-?[0-9]+)").matcher(json);
+        check(m.find(), "no number \"" + key + "\" in " + json);
+        return Long.parseLong(m.group(1));
+    }
+
+    /** The list after {@code "key":} in a JSON text, as its raw text between the brackets. */
+    static String jsonList(String json, String key) {
+        java.util.regex.Matcher m = Pattern.compile("\"" + Pattern.quote(key) + "\":\\[([^\\]]*)\\]").matcher(json);
+        check(m.find(), "no list \"" + key + "\" in " + json);
+        return m.group(1);
+    }
+
+    /** A clock that only moves when a test moves it. */
+    static final class TestClock extends java.time.Clock {
+        volatile java.time.Instant now = java.time.Instant.parse("2026-10-26T12:00:00Z");
+
+        void advance(long millis) {
+            now = now.plusMillis(millis);
+        }
+
+        @Override
+        public java.time.ZoneId getZone() {
+            return java.time.ZoneOffset.UTC;
+        }
+
+        @Override
+        public java.time.Clock withZone(java.time.ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public java.time.Instant instant() {
+            return now;
+        }
+    }
+
+    /** Waits up to {@code millis} for {@code condition}; fails the test with {@code what} otherwise. */
+    static void waitUntil(long millis, String what, java.util.function.BooleanSupplier condition) {
+        long deadline = System.nanoTime() + millis * 1_000_000L;
+        while (!condition.getAsBoolean()) {
+            check(System.nanoTime() < deadline, "timed out waiting for " + what);
+            sleepQuietly(20);
+        }
     }
 
     static RawResponse upload(int port, byte[] data) throws IOException {

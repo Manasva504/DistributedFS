@@ -105,6 +105,11 @@ public final class RemoteCrashUploadMain {
         }
 
         @Override
+        public void checkHealth() throws IOException {
+            node.checkHealth();
+        }
+
+        @Override
         public Optional<Path> localDirectory() {
             return node.localDirectory();
         }

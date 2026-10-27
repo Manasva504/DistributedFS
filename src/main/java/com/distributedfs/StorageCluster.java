@@ -20,8 +20,10 @@ import java.util.Set;
  *
  * <p><b>Replication.</b> Each chunk is stored on {@link #replicas()} different nodes (1 unless
  * the caller asks for more; the server uses 2, or 1 in a one-node cluster). A node never holds two
- * copies of one chunk, and no chunk has more copies than the replication factor: a chunk found on
- * more nodes than that is refused rather than read or deleted.
+ * copies of one chunk. A chunk may have more copies than the replication factor, for example after
+ * a node that was down comes back with copies that were replaced meanwhile: that chunk is
+ * over-replicated, which is reported (and trimmed by repair) but is not an error; it is read and
+ * deleted like any other.
  *
  * <p><b>Placement.</b> Stores go round-robin. Copy 1 goes on the next node in turn, copy 2 on the
  * next different node after it, and so on; the next store starts at the node after this store's
@@ -162,6 +164,15 @@ public class StorageCluster {
     /** How many copies of each chunk the cluster stores, each on a different node. */
     public int replicas() {
         return replicas;
+    }
+
+    /**
+     * Node {@code index} itself. Package-private for repair ({@link RepairService}), which must
+     * read, store and delete single copies on chosen nodes rather than go through the cluster's
+     * placement.
+     */
+    ChunkStore node(int index) {
+        return nodes.get(index);
     }
 
     /** "node 2", for messages, with the node's own description. */
@@ -416,15 +427,11 @@ public class StorageCluster {
      * @throws NullPointerException if {@code chunkId} is null
      * @throws IllegalArgumentException if the chunk ID is invalid
      * @throws ChunkNotFoundException if every node confirms it does not hold the chunk
-     * @throws IOException if no node holds it but some node could not be checked, or if more nodes
-     *         hold it than the replication factor allows (the cluster refuses to choose between copies)
+     * @throws IOException if no node holds it but some node could not be checked
      */
     public int locateChunk(String chunkId) throws IOException {
         Objects.requireNonNull(chunkId, "chunkId must not be null");
         NodeAnswers answers = askEveryNode(chunkId);
-        if (answers.holders.size() > replicas) {
-            throw tooManyCopies(chunkId, answers.holders, "refusing to choose between copies");
-        }
         if (!answers.holders.isEmpty()) {
             return answers.holders.get(0);
         }
@@ -441,8 +448,8 @@ public class StorageCluster {
      * <p>First every node is asked, and nothing is deleted while asking. The question is not
      * {@link #hasChunk}, which follows links, but a stricter one: a node holds the chunk only if
      * its storage directory is a plain directory and the chunk's entry is a regular file, both read
-     * without following links. The copies are deleted only if every node answered, and at most
-     * {@link #replicas()} hold one. The round-robin position for stores is not changed.
+     * without following links. The copies are deleted only if every node answered, and then all
+     * of them, however many there are. The round-robin position for stores is not changed.
      *
      * <p>Like the rest of this class, this assumes a single thread and nodes that nothing else
      * writes to: checking the nodes and then deleting is not atomic.
@@ -454,8 +461,7 @@ public class StorageCluster {
      *         files are read)
      * @throws IOException if some node could not be checked safely (for example it is down, its
      *         storage is unavailable, or the entry under the chunk's ID is a link, junction or
-     *         directory) or too many nodes hold the chunk, in which cases nothing is deleted; or if
-     *         deleting a copy failed (with one holder, exactly what that node's
+     *         directory), in which case nothing is deleted; or if deleting a copy failed (with one holder, exactly what that node's
      *         {@link ChunkStore#deleteChunk} throws; other copies were still deleted)
      */
     public boolean deleteChunk(String chunkId) throws IOException {
@@ -464,9 +470,6 @@ public class StorageCluster {
         if (!answers.errors.isEmpty()) {
             throw withNodeErrors("Cannot delete chunk \"" + chunkId + "\": " + describeNodes(answers.uncheckedNodes)
                     + " could not be checked safely, so nothing was deleted", answers.errors);
-        }
-        if (answers.holders.size() > replicas) {
-            throw tooManyCopies(chunkId, answers.holders, "refusing to delete any copy");
         }
         if (answers.holders.size() == 1) {
             return nodes.get(answers.holders.get(0)).deleteChunk(chunkId);
@@ -539,13 +542,6 @@ public class StorageCluster {
     private IOException cannotTell(String chunkId, NodeAnswers answers) {
         return withNodeErrors("Cannot tell whether chunk \"" + chunkId + "\" exists: no node holds it, but "
                 + describeNodes(answers.uncheckedNodes) + " could not be checked", answers.errors);
-    }
-
-    /** More holders than the replication factor allows; the message names them. */
-    private IOException tooManyCopies(String chunkId, List<Integer> holders, String consequence) {
-        String limit = replicas == 1 ? "more than one node" : "more than " + replicas + " nodes";
-        return new IOException("Chunk \"" + chunkId + "\" is stored on " + limit + " (" + describeNodes(holders)
-                + "); " + consequence);
     }
 
     /**

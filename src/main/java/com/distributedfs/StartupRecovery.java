@@ -37,11 +37,13 @@ import java.util.regex.Pattern;
  *       <i>committed</i>; confirmed absent means it is <i>incomplete</i>.
  *       <ul>
  *         <li>Committed: the manifest's chunk count must equal the marker's, and each chunk
- *             {@code F_i} (i &lt; chunkCount) must be a regular file on exactly one node, with every
- *             node answering. The only action is deleting the marker. Canonical extra chunks
+ *             {@code F_i} (i &lt; chunkCount) must be a regular file on at least one node, with every
+ *             node answering (fewer copies than the cluster's replication factor R are reported as
+ *             under-replicated, more as over-replicated; neither is unsafe). The only action is deleting the marker. Canonical extra chunks
  *             {@code F_k} (k &ge; chunkCount) are left alone and reported by the chunk scan.</li>
  *         <li>Incomplete: the candidates are {@code F_0 .. F_(n-1)} for the marker's chunk count n.
- *             Each one present must be a regular file on 1 to R nodes. Every other entry in
+ *             Each one present must be a regular file on every node that lists it (any number of
+ *             nodes; every copy is deleted). Every other entry in
  *             F's namespace ({@code F_...}) is unsafe, except node temp files of candidates, which
  *             the temp sweep removes. The actions are deleting the present candidates (every
  *             copy), highest index first, then the marker.</li>
@@ -50,7 +52,7 @@ import java.util.regex.Pattern;
  *   <li><b>Act</b>, marker by marker. The marker is deleted last, only once every chunk delete
  *       succeeded. If an action fails, F is checked again, read-only. When that re-check shows the
  *       same understood state (same kind, same marker and manifest, every remaining chunk a regular
- *       file on at most R nodes or absent, nothing unexpected), the cleanup is deferred: the marker
+ *       file or absent, nothing unexpected), the cleanup is deferred: the marker
  *       is kept so the next start retries, a warning is logged, and recovery continues. Anything
  *       else stops recovery at once, and the exception says which uploads were already resolved.</li>
  *   <li><b>Sweep stale temp files</b> in the manifest folder, each node folder and the tmp folder
@@ -74,7 +76,7 @@ import java.util.regex.Pattern;
  * stored as {@code F_i}, and every file ID is exactly 32 characters, so {@code F_i} and
  * {@code G_j} can only be equal when F and G are the same file. Recovery deletes only candidates
  * of a marker's own file ID and chunk count, only while that file has no manifest, and only
- * through StorageCluster.deleteChunk, which deletes regular files held by at most R nodes.
+ * through StorageCluster.deleteChunk, which deletes every regular-file copy of a chunk.
  *
  * <p><b>Local and remote nodes.</b> Recovery sees the nodes as {@link ChunkStore}s, so every
  * listing, every no-follow check and every temp sweep runs on the node itself: a local
@@ -98,9 +100,9 @@ final class StartupRecovery {
 
     /**
      * FileService.newUploadWorkspace and newDownloadWorkspace: {@code Files.createTempDirectory(tmp,
-     * "upload-")} or {@code "download-"}, so 1 to 20 digits.
+     * "upload-")} or {@code "download-"}, and RepairService's {@code "repair-"}, so 1 to 20 digits.
      */
-    private static final Pattern WORKSPACE_NAME = Pattern.compile("(upload|download)-[0-9]{1,20}");
+    private static final Pattern WORKSPACE_NAME = Pattern.compile("(upload|download|repair)-[0-9]{1,20}");
 
     /** What the chunk scan found. */
     enum FindingType {
@@ -133,12 +135,16 @@ final class StartupRecovery {
      * @param tempItemsRemoved stale temp files and workspaces removed
      * @param findings         the chunk scan's findings
      * @param uncheckedFiles   file IDs whose manifest could not be read, so their chunks were not classified
+     * @param waiting          interrupted uploads that cannot be decided while a node is missing;
+     *                         their markers were kept, and the next start tries again
      */
     record Result(List<String> committed, List<String> rolledBack, int chunksDeleted, List<String> deferred,
-                  int tempItemsRemoved, List<Finding> findings, List<String> uncheckedFiles) {
+                  int tempItemsRemoved, List<Finding> findings, List<String> uncheckedFiles, List<String> waiting) {
     }
 
     private final List<ChunkStore> nodes;
+    /** Nodes that did not answer when the server started (degraded startup); never asked anything. */
+    private final Set<Integer> missing;
     private final StorageCluster cluster;
     private final ManifestStore manifests;
     private final Path tmpDir;
@@ -153,6 +159,16 @@ final class StartupRecovery {
      */
     StartupRecovery(List<? extends ChunkStore> nodes, StorageCluster cluster, ManifestStore manifests, Path tmpDir,
                     PrintStream out, PrintStream err) {
+        this(nodes, Set.of(), cluster, manifests, tmpDir, out, err);
+    }
+
+    /**
+     * A degraded start: the nodes in {@code missing} did not answer when the server started. They
+     * are never asked anything; uploads that cannot be decided without them wait for the next start.
+     */
+    StartupRecovery(List<? extends ChunkStore> nodes, Set<Integer> missing, StorageCluster cluster,
+                    ManifestStore manifests, Path tmpDir, PrintStream out, PrintStream err) {
+        this.missing = Set.copyOf(Objects.requireNonNull(missing, "missing must not be null"));
         this.nodes = List.copyOf(Objects.requireNonNull(nodes, "nodes must not be null"));
         this.cluster = Objects.requireNonNull(cluster, "cluster must not be null");
         this.manifests = Objects.requireNonNull(manifests, "manifests must not be null");
@@ -182,9 +198,12 @@ final class StartupRecovery {
         List<Assessment> plans = new ArrayList<>();
         Map<String, String> unsafe = new LinkedHashMap<>();
         Throwable firstCause = null;
+        Map<String, String> waiting = new LinkedHashMap<>();
         for (String fileId : before.pendingIds()) {
             try {
                 plans.add(assess(fileId, before));
+            } catch (Waits e) {
+                waiting.put(fileId, e.getMessage()); // decided at a start when every node answers
             } catch (Unsafe e) {
                 unsafe.put(fileId, e.getMessage());
                 if (firstCause == null) {
@@ -240,8 +259,14 @@ final class StartupRecovery {
                     + rolledBack.size() + " rolled back (" + chunksDeleted + " chunk(s) deleted), " + deferred.size()
                     + " deferred; " + tempItemsRemoved + " stale temp file(s) or workspace(s) removed");
         }
+        if (!waiting.isEmpty()) {
+            out.println("Recovery: " + waiting.size() + " interrupted upload(s) wait for " + onNodes(List.copyOf(
+                    new TreeSet<>(missing))) + ", which did not answer; their markers were kept, and the next start"
+                    + " tries again:");
+            waiting.forEach((fileId, reason) -> out.println("  " + fileId + ": " + reason));
+        }
         return new Result(List.copyOf(committed), List.copyOf(rolledBack), chunksDeleted, List.copyOf(deferred),
-                tempItemsRemoved, List.copyOf(findings), List.copyOf(uncheckedFiles));
+                tempItemsRemoved, List.copyOf(findings), List.copyOf(uncheckedFiles), List.copyOf(waiting.keySet()));
     }
 
     // ---------------------------------------------------------------------
@@ -267,10 +292,12 @@ final class StartupRecovery {
         }
         List<List<String>> nodeNames = new ArrayList<>();
         List<Set<String>> nodeNameSets = new ArrayList<>();
-        for (ChunkStore node : nodes) {
+        for (int node = 0; node < nodes.size(); node++) {
             List<String> names = new ArrayList<>();
-            for (ChunkStore.Entry entry : node.listEntries()) {
-                names.add(entry.name());
+            if (!missing.contains(node)) { // a missing node is never asked; it lists as empty
+                for (ChunkStore.Entry entry : nodes.get(node).listEntries()) {
+                    names.add(entry.name());
+                }
             }
             nodeNames.add(names);
             nodeNameSets.add(new HashSet<>(names));
@@ -302,7 +329,16 @@ final class StartupRecovery {
         }
     }
 
-    private Assessment assess(String fileId, Snapshot snapshot) throws Unsafe {
+    /** The marker cannot be decided while a node is missing; it is kept for the next start. */
+    private static final class Waits extends Exception {
+        private static final long serialVersionUID = 1L;
+
+        Waits(String reason) {
+            super(reason);
+        }
+    }
+
+    private Assessment assess(String fileId, Snapshot snapshot) throws Unsafe, Waits {
         ManifestStore.PendingUpload marker;
         try {
             Optional<ManifestStore.PendingUpload> read = manifests.readPending(fileId);
@@ -331,6 +367,11 @@ final class StartupRecovery {
             return new Assessment(fileId, Kind.COMMITTED, marker, manifest.get(), List.of());
         }
         checkNamespace(fileId, chunkCount, false, snapshot);
+        if (!missing.isEmpty()) {
+            // A missing node may hold candidates: deleting the others now could not finish the job.
+            throw new Waits("it is incomplete, and " + onNodes(List.copyOf(new TreeSet<>(missing)))
+                    + " may hold some of its chunks");
+        }
         return new Assessment(fileId, Kind.INCOMPLETE, marker, null, presentCandidates(fileId, chunkCount, snapshot));
     }
 
@@ -362,16 +403,20 @@ final class StartupRecovery {
         }
     }
 
-    /** D3: every chunk of a committed upload must be a regular file on 1 to R nodes. */
-    private void verifyCommittedChunks(String fileId, int chunkCount, Snapshot snapshot) throws Unsafe {
+    /**
+     * D3: every chunk of a committed upload must be a regular file on at least one node. More
+     * copies than the replication factor are fine (a node that came back with old copies); the
+     * chunk scan reports them as over-replicated.
+     */
+    private void verifyCommittedChunks(String fileId, int chunkCount, Snapshot snapshot) throws Unsafe, Waits {
         for (int i = 0; i < chunkCount; i++) {
             String chunkId = FileIds.chunkId(fileId, i);
             List<Integer> listed = listedOn(chunkId, snapshot);
             if (listed.isEmpty()) {
+                if (!missing.isEmpty()) {
+                    throw new Waits("it is committed, but no node that answered holds its chunk " + chunkId);
+                }
                 throw new Unsafe("it is committed, but its chunk " + chunkId + " is missing from every node", null);
-            }
-            if (listed.size() > replicas()) {
-                throw new Unsafe("it is committed, but its chunk " + chunkId + " is on " + tooMany() + " " + listed, null);
             }
             List<Integer> holders = regularHolders(chunkId);
             if (!holders.equals(listed)) {
@@ -396,9 +441,6 @@ final class StartupRecovery {
         for (int index : indexes.descendingSet()) {
             String chunkId = FileIds.chunkId(fileId, index);
             List<Integer> listed = listedOn(chunkId, snapshot);
-            if (listed.size() > replicas()) {
-                throw new Unsafe("its chunk " + chunkId + " is on " + tooMany() + " " + listed, null);
-            }
             List<Integer> regular = regularHolders(chunkId);
             if (!regular.equals(listed)) {
                 throw new Unsafe("its chunk " + chunkId + " changed while recovery was checking it (listed on nodes "
@@ -423,6 +465,9 @@ final class StartupRecovery {
     private List<Integer> regularHolders(String chunkId) throws Unsafe {
         List<Integer> holders = new ArrayList<>();
         for (int node = 0; node < nodes.size(); node++) {
+            if (missing.contains(node)) {
+                continue;
+            }
             try {
                 if (nodes.get(node).holdsRegularChunk(chunkId)) {
                     holders.add(node);
@@ -503,7 +548,7 @@ final class StartupRecovery {
         Assessment again;
         try {
             again = assess(plan.fileId(), now);
-        } catch (Unsafe e) {
+        } catch (Unsafe | Waits e) {
             return e.getMessage();
         }
         if (again.kind() != plan.kind()) {
@@ -573,6 +618,10 @@ final class StartupRecovery {
             warn.accept("could not sweep stale temp files in the manifest folder: " + e);
         }
         for (int node = 0; node < nodes.size(); node++) {
+            if (missing.contains(node)) {
+                warn.accept("the temp-file sweep skipped node " + node + ": it did not answer when the server started");
+                continue;
+            }
             try {
                 removed += nodes.get(node).sweepTempFiles(warn);
             } catch (IOException | RuntimeException e) {
@@ -648,6 +697,11 @@ final class StartupRecovery {
         boolean everyNodeListed = true;
         for (int node = 0; node < nodes.size(); node++) {
             List<ChunkStore.Entry> entries;
+            if (missing.contains(node)) {
+                err.println("Warning: the chunk scan skipped node " + node + ": it did not answer when the server started");
+                everyNodeListed = false;
+                continue;
+            }
             try {
                 entries = nodes.get(node).listEntries();
             } catch (IOException | RuntimeException e) {
@@ -817,11 +871,6 @@ final class StartupRecovery {
     /** The cluster's replication factor: how many copies a chunk may have. */
     private int replicas() {
         return cluster.replicas();
-    }
-
-    /** "more than one node", or "more than 2 nodes", for messages. */
-    private String tooMany() {
-        return replicas() == 1 ? "more than one node" : "more than " + replicas() + " nodes";
     }
 
     /** "node 1" or "nodes [0, 2]". */
