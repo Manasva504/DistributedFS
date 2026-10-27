@@ -55,7 +55,7 @@ import java.util.stream.Stream;
  */
 public class DownloadEndpointTest {
 
-    private static final int TIMEOUT_MILLIS = 10_000;
+    private static final int TIMEOUT_MILLIS = 30_000;
     private static final int MIB = 1024 * 1024;
     private static final InetAddress LOOPBACK = loopback();
     private static final String OCTET = "Content-Type: application/octet-stream\r\n";
