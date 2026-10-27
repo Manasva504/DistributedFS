@@ -112,6 +112,36 @@ final class ClusterMembership {
         return true;
     }
 
+    /**
+     * A degraded start: not every node answered. There must be a membership file, the server must
+     * be given one {@code --node} per recorded node, and every node that answered must be a
+     * recorded one. Returns the recorded IDs that no node answered with.
+     *
+     * @throws DataDirectoryException WRONG_NODES if not, INVALID_MARKER if the file is damaged
+     */
+    static Set<String> requireRecordedMembers(Path dataRoot, int nodeCount, List<String> answeredIds) throws IOException {
+        Optional<Set<String>> recorded = read(dataRoot.resolve(FILE_NAME));
+        if (recorded.isEmpty()) {
+            throw new DataDirectoryException(DataDirectoryException.Reason.WRONG_NODES,
+                    "Every storage node must answer the first time a data directory is used with --node options");
+        }
+        if (recorded.get().size() != nodeCount) {
+            throw new DataDirectoryException(DataDirectoryException.Reason.WRONG_NODES,
+                    "This data directory uses " + recorded.get().size() + " storage nodes (see "
+                            + dataRoot.resolve(FILE_NAME) + "), but " + nodeCount + " --node options were given");
+        }
+        Set<String> unexpected = new TreeSet<>(answeredIds);
+        unexpected.removeAll(recorded.get());
+        if (!unexpected.isEmpty()) {
+            throw new DataDirectoryException(DataDirectoryException.Reason.WRONG_NODES,
+                    "The storage nodes given are not the ones this data directory uses. Not recorded: "
+                            + String.join(", ", unexpected) + " (see " + dataRoot.resolve(FILE_NAME) + ").");
+        }
+        Set<String> unanswered = new TreeSet<>(recorded.get());
+        unanswered.removeAll(answeredIds);
+        return unanswered;
+    }
+
     /** The recorded node IDs, or empty if there is no membership file. */
     static Optional<Set<String>> read(Path file) throws IOException {
         BasicFileAttributes attributes;

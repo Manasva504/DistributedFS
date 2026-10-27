@@ -128,6 +128,22 @@ class FileService {
         return Files.createTempDirectory(tmpDir, DOWNLOAD_WORKSPACE_PREFIX);
     }
 
+    /** Work done while holding the storage lock; see {@link #withStorageLock}. */
+    interface StorageAction<T> {
+        T run() throws IOException;
+    }
+
+    /**
+     * Runs {@code action} while holding the same storage lock that uploads and downloads hold
+     * while they touch the cluster and the manifests. Repair ({@link RepairService}) uses it for
+     * each chunk, so it never works on a chunk while a request does.
+     */
+    <T> T withStorageLock(StorageAction<T> action) throws IOException {
+        synchronized (storageLock) {
+            return action.run();
+        }
+    }
+
     /**
      * Deletes a request's workspace without following links (see {@link FileTrees#deleteTree}).
      * A failure is logged, not thrown: the request's outcome does not depend on it.

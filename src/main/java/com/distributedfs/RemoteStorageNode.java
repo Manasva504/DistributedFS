@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -76,8 +77,17 @@ final class RemoteStorageNode implements ChunkStore, AutoCloseable {
     private static final String HOST = "127.0.0.1";
     private static final int BUFFER_SIZE = 64 * 1024;
 
+    /** The longest a health check may take, so a heartbeat stays within its interval. */
+    static final long HEALTH_TIMEOUT_MILLIS = 1_000;
+
     private final int port;
-    private final String nodeId;
+    /** The node's ID; null for a node that has not answered yet (see {@link #unidentified}). */
+    private volatile String nodeId;
+    /**
+     * For an unidentified node: the IDs it may turn out to have, shared with the other unidentified
+     * nodes of the same start; pinning removes the ID, so no two clients can claim it. Empty otherwise.
+     */
+    private final Set<String> candidateIds;
     private final RemoteNodeConfig config;
     private final HttpClient client;
 
@@ -96,8 +106,48 @@ final class RemoteStorageNode implements ChunkStore, AutoCloseable {
         }
         this.port = port;
         this.nodeId = nodeId;
+        this.candidateIds = Set.of();
         this.config = Objects.requireNonNull(config, "config must not be null");
         this.client = newClient(config);
+    }
+
+    private RemoteStorageNode(int port, Set<String> candidateIds, RemoteNodeConfig config) {
+        this.port = port;
+        this.nodeId = null;
+        this.candidateIds = candidateIds;
+        this.config = config;
+        this.client = newClient(config);
+    }
+
+    /**
+     * A client for a node that did not answer when the server started, so its ID is not known
+     * yet; it is one of {@code candidateIds} (the recorded IDs that no other node answered with).
+     * Until a health check ({@link #checkHealth}) gets an answer with one of those IDs, which then
+     * pins the client to it for good, every other operation fails at once with
+     * {@link NodeUnavailableException}, as for a node that cannot be reached.
+     *
+     * @param candidateIds a thread-safe, modifiable set, the same one for every unidentified node of
+     *                     a start: pinning removes the ID from it, so a node that answers on two
+     *                     ports one after the other is claimed by the first only
+     */
+    static RemoteStorageNode unidentified(int port, Set<String> candidateIds, RemoteNodeConfig config) {
+        if (port < 1 || port > 65535) {
+            throw new IllegalArgumentException("port must be 1 to 65535, but was " + port);
+        }
+        if (candidateIds.isEmpty() || !candidateIds.stream().allMatch(id -> NodeProtocol.NODE_ID.matcher(id).matches())) {
+            throw new IllegalArgumentException("candidateIds must be node IDs, and at least one");
+        }
+        return new RemoteStorageNode(port, candidateIds, Objects.requireNonNull(config, "config must not be null"));
+    }
+
+    /** The pinned node ID, or NodeUnavailableException if the node has not been identified yet. */
+    private String id() throws NodeUnavailableException {
+        String id = nodeId;
+        if (id == null) {
+            throw new NodeUnavailableException(describe() + " has not answered since the server started, so it is not"
+                    + " used yet", null);
+        }
+        return id;
     }
 
     /**
@@ -138,12 +188,45 @@ final class RemoteStorageNode implements ChunkStore, AutoCloseable {
      * @throws IOException otherwise
      */
     void health() throws IOException {
-        Reply reply = call("check the node's health", get(NodeProtocol.HEALTH_PATH), config.maxReplyBytes());
+        checkHealth();
+    }
+
+    /**
+     * {@inheritDoc} {@code GET /health}, with a time limit of at most {@link #HEALTH_TIMEOUT_MILLIS}
+     * so that a heartbeat is never slower than its interval. The answer must be a storage node's,
+     * with this node's ID; a different ID is a failure. An unidentified node is pinned here to the
+     * ID it answers with, if that is one of its candidate IDs.
+     */
+    @Override
+    public void checkHealth() throws IOException {
+        String expected = nodeId;
+        String what = "check its health";
+        Reply reply;
+        try {
+            reply = send(client, request(port, NodeProtocol.HEALTH_PATH,
+                    Math.min(HEALTH_TIMEOUT_MILLIS, config.requestTimeoutMillis())).GET().build(),
+                    expected, config.maxReplyBytes(), null, config.stallTimeoutMillis());
+        } catch (IOException e) {
+            throw unreachable(what, e);
+        }
         Map<String, String> fields = NodeProtocol.parseFields(reply.body());
+        String answered = fields == null ? null : fields.get("node-id");
         if (reply.status() != 200 || fields == null || fields.size() != 3 || !"ok".equals(fields.get("status"))
-                || !nodeId.equals(fields.get("node-id"))
-                || !Integer.toString(NodeProtocol.FORMAT).equals(fields.get("format"))) {
-            throw failure("check the node's health", reply);
+                || !Integer.toString(NodeProtocol.FORMAT).equals(fields.get("format"))
+                || answered == null || !answered.equals(reply.nodeIdHeader())) {
+            throw failure(what, reply);
+        }
+        if (expected == null) {
+            synchronized (this) {
+                if (nodeId == null && candidateIds.remove(answered)) {
+                    nodeId = answered;
+                }
+                expected = nodeId;
+            }
+        }
+        if (!answered.equals(expected)) {
+            throw new IOException(describe() + " was answered by " + describeHeaderId(answered)
+                    + ", which is not the node expected there");
         }
     }
 
@@ -154,6 +237,7 @@ final class RemoteStorageNode implements ChunkStore, AutoCloseable {
     @Override
     public long storeChunk(String chunkId, Path sourceFile) throws IOException {
         StorageNode.validateChunkId(chunkId);
+        String nodeId = id();
         StorageNode.validateSourceFile(sourceFile);
         long size = Files.size(sourceFile);
         String sha256 = new ChecksumService().calculateSha256(sourceFile);
@@ -216,6 +300,7 @@ final class RemoteStorageNode implements ChunkStore, AutoCloseable {
         }
         String what = "send chunk " + chunkId;
         Reply reply;
+        String nodeId = id(); // outside the try: an unidentified node is unavailable, not unreadable
         try {
             reply = send(client, get(NodeProtocol.CHUNKS_PREFIX + chunkId), nodeId, config.maxReplyBytes(),
                     destination, config.stallTimeoutMillis());
@@ -311,12 +396,13 @@ final class RemoteStorageNode implements ChunkStore, AutoCloseable {
 
     @Override
     public Optional<String> nodeId() {
-        return Optional.of(nodeId);
+        return Optional.ofNullable(nodeId);
     }
 
     @Override
     public String describe() {
-        return "storage node " + nodeId + " at " + HOST + ":" + port;
+        String id = nodeId;
+        return "storage node " + (id == null ? "(not yet identified)" : id) + " at " + HOST + ":" + port;
     }
 
     int port() {
@@ -358,6 +444,7 @@ final class RemoteStorageNode implements ChunkStore, AutoCloseable {
     /** A small request with the shared client; the reply must come from this node. */
     private Reply call(String what, HttpRequest request, int maxBytes) throws IOException {
         Reply reply;
+        String nodeId = id(); // outside the try: an unidentified node is unavailable, not unreadable
         try {
             reply = send(client, request, nodeId, maxBytes, null, config.stallTimeoutMillis());
         } catch (IOException e) {
@@ -368,7 +455,8 @@ final class RemoteStorageNode implements ChunkStore, AutoCloseable {
     }
 
     private void requireThisNode(Reply reply) throws IOException {
-        if (!nodeId.equals(reply.nodeIdHeader())) {
+        String expected = nodeId;
+        if (expected == null || !expected.equals(reply.nodeIdHeader())) {
             throw new IOException(describe() + " was answered by " + describeHeaderId(reply.nodeIdHeader())
                     + "; its answer was not used");
         }

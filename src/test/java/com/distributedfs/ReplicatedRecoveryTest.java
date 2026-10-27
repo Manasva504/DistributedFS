@@ -40,9 +40,9 @@ public class ReplicatedRecoveryTest {
         RUNNER.run("a committed upload with 1 copy of a chunk is accepted and reported as under-replicated",
                 ReplicatedRecoveryTest::committedOneCopy);
         RUNNER.run("a committed upload with a chunk on no node stops the start", ReplicatedRecoveryTest::committedNoCopy);
-        RUNNER.run("a committed upload with a chunk on 3 nodes stops the start", ReplicatedRecoveryTest::committedThreeCopies);
+        RUNNER.run("a committed upload with a chunk on 3 nodes is accepted and reported as over-replicated", ReplicatedRecoveryTest::committedThreeCopies);
         RUNNER.run("an interrupted upload's chunks are deleted from both of their nodes", ReplicatedRecoveryTest::twoHolderRecovery);
-        RUNNER.run("an interrupted upload with a chunk on 3 nodes stops the start", ReplicatedRecoveryTest::incompleteThreeCopies);
+        RUNNER.run("an interrupted upload with a chunk on 3 nodes has all 3 copies deleted", ReplicatedRecoveryTest::incompleteThreeCopies);
         RUNNER.run("an orphan chunk with 2 copies is reported once per copy and left alone",
                 ReplicatedRecoveryTest::orphanTwoCopies);
         RUNNER.run("the scan reports under-replicated, lost and over-replicated chunks of committed files",
@@ -95,8 +95,11 @@ public class ReplicatedRecoveryTest {
             String id = s.uploadFile(1, 4);
             s.storeOnEveryNode(FileIds.chunkId(id, 0));
             s.markPending(id, 1);
-            UnsafeRecoveryException e = expectThrows(UnsafeRecoveryException.class, "start", s::restart);
-            checkContains(e.getMessage(), "more than 2 nodes");
+            // Since milestone M3, more copies than the replication factor are accepted and reported.
+            String out = s.restart();
+            checkContains(out, "1 committed");
+            checkContains(out, "OVER_REPLICATED " + FileIds.chunkId(id, 0) + " (3 of 2 copies, on nodes [0, 1, 2])");
+            checkEquals(List.of(1, 1, 1), s.cluster.chunkCounts(), "every copy is kept");
         }
     }
 
@@ -119,9 +122,9 @@ public class ReplicatedRecoveryTest {
         try (Setup s = Setup.start(tempDir)) {
             s.markPending(F, 1);
             s.storeOnEveryNode(F + "_0");
-            UnsafeRecoveryException e = expectThrows(UnsafeRecoveryException.class, "start", s::restart);
-            checkContains(e.getMessage(), "more than 2 nodes");
-            checkEquals(List.of(1, 1, 1), s.cluster.chunkCounts(), "nothing was deleted");
+            // Since milestone M3 every copy of the candidate is deleted, however many there are.
+            checkContains(s.restart(), "1 rolled back (1 chunk(s) deleted)");
+            checkEquals(List.of(0, 0, 0), s.cluster.chunkCounts(), "every copy was deleted");
         }
     }
 

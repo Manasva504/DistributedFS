@@ -93,8 +93,8 @@ public class StorageClusterTest {
         runTest("an ID already on a different node is not stored again", StorageClusterTest::duplicateOnDifferentNode);
         runTest("a chunk that appears on the chosen node mid-store is not stored on another node",
                 StorageClusterTest::chunkAppearingDuringStoreIsNotStoredElsewhere);
-        runTest("an ID found on two nodes is refused instead of picking a copy",
-                StorageClusterTest::duplicatesOnTwoNodesAreRefused);
+        runTest("an ID found on two nodes is located on the first one",
+                StorageClusterTest::duplicatesOnTwoNodesUseTheFirst);
 
         // Missing chunks and invalid input
         runTest("a missing chunk throws ChunkNotFoundException and creates nothing", StorageClusterTest::missingChunk);
@@ -122,8 +122,8 @@ public class StorageClusterTest {
                 StorageClusterTest::deleteFromSoleHolder);
         runTest("deleteChunk returns false only after every node confirmed it has no such chunk",
                 StorageClusterTest::deleteMissingChunkChecksEveryNode);
-        runTest("deleteChunk refuses an ID found on two nodes and deletes neither copy",
-                StorageClusterTest::deleteRefusesDuplicates);
+        runTest("deleteChunk deletes an ID found on two nodes from both",
+                StorageClusterTest::deleteRemovesDuplicates);
         runTest("deleteChunk with an unavailable node fails, deletes nothing, and never says 'not found'",
                 StorageClusterTest::deleteWithUnavailableNodeFails);
         runTest("deleteChunk with a node whose check fails deletes nothing", StorageClusterTest::deleteWithFailingCheckFails);
@@ -422,7 +422,7 @@ public class StorageClusterTest {
         checkEquals(List.of(), listNames(nodeDir(tempDir, 2)), "files on node 2");
     }
 
-    private static void duplicatesOnTwoNodesAreRefused(Path tempDir) throws IOException {
+    private static void duplicatesOnTwoNodesUseTheFirst(Path tempDir) throws IOException {
         List<StorageNode> nodes = createNodes(tempDir, 3);
         StorageCluster cluster = new StorageCluster(nodes);
         // Two different copies of "x", planted by bypassing the cluster.
@@ -430,14 +430,12 @@ public class StorageClusterTest {
         nodes.get(2).storeChunk("x", Files.write(tempDir.resolve("b.bin"), randomBytes(50, 2)));
         Path destination = tempDir.resolve("retrieved.bin");
 
-        IOException e1 = expectThrows(IOException.class, () -> cluster.locateChunk("x"));
-        checkContains(e1.getMessage(), "more than one node (nodes [0, 2])");
-        check(!(e1 instanceof ChunkNotFoundException), "two copies must not be reported as a missing chunk");
-
-        IOException e2 = expectThrows(IOException.class, () -> cluster.retrieveChunk("x", destination));
-        checkContains(e2.getMessage(), "more than one node");
-        check(!Files.exists(destination), "no destination should be created when the copy is ambiguous");
-
+        // More copies than the replication factor are allowed since milestone M3 (a node that
+        // comes back with old copies): the first holder is used. Reads that must be right check
+        // each copy against its SHA-256 (retrieveVerifiedChunk); this plain read does not.
+        checkEquals(0, cluster.locateChunk("x"), "the first holder");
+        cluster.retrieveChunk("x", destination);
+        checkBytes(randomBytes(50, 1), destination);
         check(cluster.hasChunk("x"), "hasChunk should still be true: the chunk is stored");
     }
 
@@ -772,7 +770,7 @@ public class StorageClusterTest {
         checkBytes(data, nodeDir(tempDir, 0).resolve("chunk_0"));
     }
 
-    private static void deleteRefusesDuplicates(Path tempDir) throws IOException {
+    private static void deleteRemovesDuplicates(Path tempDir) throws IOException {
         List<RecordingNode> nodes = recordingNodes(tempDir, 3);
         StorageCluster cluster = new StorageCluster(new ArrayList<>(nodes));
         byte[] stored = randomBytes(100, 1);
@@ -780,12 +778,12 @@ public class StorageClusterTest {
         cluster.storeChunk("chunk_0", Files.write(tempDir.resolve("source.bin"), stored));
         Files.write(nodeDir(tempDir, 2).resolve("chunk_0"), planted); // a second copy, bypassing the cluster
 
-        IOException e = expectThrows(IOException.class, () -> cluster.deleteChunk("chunk_0"));
+        // Since milestone M3 a delete removes every copy, however many there are.
+        check(cluster.deleteChunk("chunk_0"), "delete both copies");
 
-        checkContains(e.getMessage(), "more than one node (nodes [0, 2])");
-        checkBytes(stored, nodeDir(tempDir, 0).resolve("chunk_0"));
-        checkBytes(planted, nodeDir(tempDir, 2).resolve("chunk_0"));
-        checkEquals(List.of(0, 0, 0), nodes.stream().map(node -> node.deletes).toList(), "deletes per node");
+        check(!Files.exists(nodeDir(tempDir, 0).resolve("chunk_0")), "the copy on node 0 is gone");
+        check(!Files.exists(nodeDir(tempDir, 2).resolve("chunk_0")), "the copy on node 2 is gone");
+        checkEquals(List.of(1, 0, 1), nodes.stream().map(node -> node.deletes).toList(), "deletes per node");
     }
 
     private static void deleteWithUnavailableNodeFails(Path tempDir) throws IOException {
@@ -948,12 +946,12 @@ public class StorageClusterTest {
         cluster.storeChunk("chunk_1", Files.write(tempDir.resolve("source_1"), randomBytes(100, 1)));
         checkEquals(1, cluster.locateChunk("chunk_1"), "node holding chunk_1");
 
-        // A successful delete, a delete of a missing chunk, a refused delete and an invalid ID.
+        // A successful delete, a delete of a missing chunk, a delete of two copies and an invalid ID.
         check(cluster.deleteChunk("chunk_0"), "delete chunk_0");
         check(!cluster.deleteChunk("chunk_9"), "delete a chunk never stored");
         Files.write(nodeDir(tempDir, 0).resolve("dup"), randomBytes(10, 3));
         Files.write(nodeDir(tempDir, 1).resolve("dup"), randomBytes(10, 4));
-        expectThrows(IOException.class, "duplicated ID", () -> cluster.deleteChunk("dup"));
+        check(cluster.deleteChunk("dup"), "delete an ID found on two nodes");
         expectThrows(IllegalArgumentException.class, "invalid ID", () -> cluster.deleteChunk("../x"));
 
         // Stores continue exactly where they left off: node 2, then 0, then 1. A deleted ID can be stored again.

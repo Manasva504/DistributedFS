@@ -55,7 +55,7 @@ public class ReplicatedClusterTest {
         // Locating and deleting
         RUNNER.run("deleting removes both copies", ReplicatedClusterTest::deleteRemovesBothCopies);
         RUNNER.run("deleting with a node down deletes nothing", ReplicatedClusterTest::deleteWithNodeDown);
-        RUNNER.run("three copies are refused for locating and deleting", ReplicatedClusterTest::threeCopiesAreRefused);
+        RUNNER.run("three copies are located on the first holder and all deleted", ReplicatedClusterTest::threeCopiesAreAllowed);
 
         // Verified reads
         RUNNER.run("a verified read keeps the first good copy", ReplicatedClusterTest::firstGoodCopy);
@@ -237,19 +237,19 @@ public class ReplicatedClusterTest {
         checkEquals(List.of("c_0"), listNames(nodes.get(1).dir()), "node 1 keeps its copy");
     }
 
-    private static void threeCopiesAreRefused(Path tempDir) throws Exception {
+    private static void threeCopiesAreAllowed(Path tempDir) throws Exception {
         List<NodeTestKit.ControlledNode> nodes = nodes(tempDir, 3);
         for (NodeTestKit.ControlledNode node : nodes) {
             node.node.storeChunk("c_0", source(tempDir, 0));
         }
         StorageCluster cluster = new StorageCluster(nodes, 2);
-        checkContains(expectCannotTell("locate", () -> cluster.locateChunk("c_0")).getMessage(), "more than 2 nodes");
-        checkContains(expectCannotTell("delete", () -> cluster.deleteChunk("c_0")).getMessage(), "more than 2 nodes");
+        // More copies than the replication factor are allowed since milestone M3: located on the
+        // first holder, and a delete removes all of them.
+        checkEquals(0, cluster.locateChunk("c_0"), "the first holder");
+        check(cluster.deleteChunk("c_0"), "delete all three copies");
         for (NodeTestKit.ControlledNode node : nodes) {
-            checkEquals(List.of("c_0"), listNames(node.dir()), "every copy is kept");
+            checkEquals(List.of(), listNames(node.dir()), "every copy is gone");
         }
-        StorageCluster two = new StorageCluster(nodes.subList(0, 2), 2);
-        checkEquals(0, two.locateChunk("c_0"), "two copies are allowed");
     }
 
     // ---------------------------------------------------------------------

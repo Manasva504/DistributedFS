@@ -40,7 +40,8 @@ public class RemoteClusterTest {
                 + " but chunks on the other nodes can still be read", RemoteClusterTest::oneNodeDown);
         RUNNER.run("a store with an unknown outcome is not retried on another node", RemoteClusterTest::ambiguousStoreIsNotRetried);
         RUNNER.run("a store that a node certainly refused moves on to the next node", RemoteClusterTest::definiteFailureFallsBack);
-        RUNNER.run("a chunk found on two remote nodes is neither read nor deleted", RemoteClusterTest::twoCopiesAreRefused);
+        RUNNER.run("a chunk found on two remote nodes is read from the first and deleted from both",
+                RemoteClusterTest::twoCopiesAreUsedAndDeleted);
         RUNNER.run("the same node reached twice is refused when the cluster is built", RemoteClusterTest::sameNodeTwiceIsRefused);
         RUNNER.run("a node answering with another node's ID counts as 'cannot tell'", RemoteClusterTest::foreignNodeCannotConfirm);
         RUNNER.run("a junction under a chunk's ID on a remote node blocks deleting, and nothing is deleted",
@@ -159,16 +160,17 @@ public class RemoteClusterTest {
         }
     }
 
-    private static void twoCopiesAreRefused(Path tempDir) throws Exception {
+    private static void twoCopiesAreUsedAndDeleted(Path tempDir) throws Exception {
         try (Nodes nodes = Nodes.start(tempDir, 3)) {
             Path source = Files.write(tempDir.resolve("source"), randomBytes(100, 5));
             nodes.remotes.get(0).storeChunk("file_0", source);
             nodes.remotes.get(2).storeChunk("file_0", source);
             StorageCluster cluster = new StorageCluster(nodes.remotes);
-            checkContains(expectCannotTell("locate", () -> cluster.locateChunk("file_0")).getMessage(), "more than one node");
-            checkContains(expectCannotTell("delete", () -> cluster.deleteChunk("file_0")).getMessage(), "more than one node");
-            checkEquals(List.of("file_0"), listNames(nodes.handles.get(0).chunksDir()), "node 0 kept its copy");
-            checkEquals(List.of("file_0"), listNames(nodes.handles.get(2).chunksDir()), "node 2 kept its copy");
+            // More copies than the replication factor are allowed since milestone M3.
+            checkEquals(0, cluster.locateChunk("file_0"), "the first holder");
+            check(cluster.deleteChunk("file_0"), "delete both copies");
+            checkEquals(List.of(), listNames(nodes.handles.get(0).chunksDir()), "node 0's copy is gone");
+            checkEquals(List.of(), listNames(nodes.handles.get(2).chunksDir()), "node 2's copy is gone");
         }
     }
 

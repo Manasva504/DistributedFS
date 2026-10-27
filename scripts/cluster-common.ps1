@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Shared helpers of scripts\demo.ps1 and scripts\kill-demo.ps1; dot-source it, do not run it.
+    Shared helpers of scripts\demo.ps1, scripts\kill-demo.ps1 and scripts\repair-demo.ps1; dot-source it, do not run it.
 
 .DESCRIPTION
     The caller sets $work (its own new temporary folder), $classes (a folder inside it) and

@@ -22,8 +22,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * The HTTP API's single request handler: it checks the Host header, routes by exact path, and
  * writes every response, including errors.
  *
- * <p>Endpoints: {@code GET /health}, {@code POST /files} and {@code GET /files/<fileId>}. Every
- * other path is 404 {@code not_found}.
+ * <p>Endpoints: {@code GET /health}, {@code POST /files} and {@code GET /files/<fileId>}, and,
+ * when the server gives the handler a {@link ClusterApi}, {@code GET /cluster/status} (no query)
+ * and {@code POST /cluster/repair} (no query, {@code ?dryRun=true} or {@code ?dryRun=false}; 409
+ * {@code repair_in_progress} while a repair runs). Every other path is 404 {@code not_found}.
  *
  * <p><b>Host check.</b> The server listens on 127.0.0.1 only, but a web page in a browser on
  * this machine could still reach it through DNS rebinding. Such requests carry the attacker's host
@@ -87,6 +89,8 @@ class FileApiHandler implements HttpHandler {
     private static final String HEALTH_BODY = "{\"status\":\"ok\"}";
     private static final String FILES_PATH = "/files";
     private static final String FILE_PATH_PREFIX = FILES_PATH + "/";
+    static final String CLUSTER_STATUS_PATH = "/cluster/status";
+    static final String CLUSTER_REPAIR_PATH = "/cluster/repair";
     private static final String OCTET_STREAM = "application/octet-stream";
     private static final int BUFFER_SIZE = 64 * 1024;
 
@@ -105,13 +109,25 @@ class FileApiHandler implements HttpHandler {
     private final PrintStream err;
     private final FileService files;
     private final long stallTimeoutMillis;
+    /** The cluster endpoints' answers; null for a handler without them (404, as for any unknown path). */
+    private final ClusterApi clusterApi;
 
     FileApiHandler(int port, PrintStream err, FileService files) {
         this(port, err, files, STALL_TIMEOUT_MILLIS);
     }
 
+    /** With the cluster endpoints {@code GET /cluster/status} and {@code POST /cluster/repair}. */
+    FileApiHandler(int port, PrintStream err, FileService files, ClusterApi clusterApi) {
+        this(port, err, files, STALL_TIMEOUT_MILLIS, Objects.requireNonNull(clusterApi, "clusterApi must not be null"));
+    }
+
     /** As above, with another stall timeout; tests use a short one. */
     FileApiHandler(int port, PrintStream err, FileService files, long stallTimeoutMillis) {
+        this(port, err, files, stallTimeoutMillis, null);
+    }
+
+    private FileApiHandler(int port, PrintStream err, FileService files, long stallTimeoutMillis, ClusterApi clusterApi) {
+        this.clusterApi = clusterApi;
         if (port < 1 || port > 65535) {
             throw new IllegalArgumentException("port must be 1 to 65535, but was " + port);
         }
@@ -182,6 +198,44 @@ class FileApiHandler implements HttpHandler {
                 return;
             }
             handleDownload(exchange, fileId);
+            return;
+        }
+        if (clusterApi != null && CLUSTER_STATUS_PATH.equals(path)) {
+            if (!"GET".equals(exchange.getRequestMethod())) {
+                sendError(exchange, ApiError.METHOD_NOT_ALLOWED, "GET");
+            } else if (target.getRawQuery() != null) {
+                sendError(exchange, ApiError.INVALID_QUERY, null);
+            } else {
+                sendJson(exchange, 200, clusterApi.statusJson());
+            }
+            return;
+        }
+        if (clusterApi != null && CLUSTER_REPAIR_PATH.equals(path)) {
+            if (!"POST".equals(exchange.getRequestMethod())) {
+                sendError(exchange, ApiError.METHOD_NOT_ALLOWED, "POST");
+                return;
+            }
+            String query = target.getRawQuery();
+            if (query != null && !query.equals("dryRun=true") && !query.equals("dryRun=false")) {
+                sendError(exchange, ApiError.INVALID_QUERY, null);
+                return;
+            }
+            // The declared body (none is expected) is read and discarded before the repair runs.
+            if (!finishRequestBody(exchange, "Repair request")) {
+                return;
+            }
+            String report;
+            try {
+                report = clusterApi.repairJson("dryRun=true".equals(query));
+            } catch (RepairService.RepairInProgressException e) {
+                sendError(exchange, ApiError.REPAIR_IN_PROGRESS, null);
+                return;
+            } catch (IOException | RuntimeException e) {
+                err.println("Error: repair failed: " + e);
+                sendError(exchange, ApiError.STORAGE_ERROR, null);
+                return;
+            }
+            sendJson(exchange, 200, report);
             return;
         }
         sendError(exchange, ApiError.NOT_FOUND, null);
