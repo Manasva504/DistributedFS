@@ -61,7 +61,7 @@ Each demo builds the program into a new temporary folder, starts three storage n
 powershell -ExecutionPolicy Bypass -File scripts\demo.ps1          # upload a 5 MiB file, download it, compare SHA-256
 powershell -ExecutionPolicy Bypass -File scripts\kill-demo.ps1     # kill a node: downloads and uploads go on
 powershell -ExecutionPolicy Bypass -File scripts\repair-demo.ps1   # kill a node, detect it, repair, restart it, trim
-powershell -ExecutionPolicy Bypass -File scripts\test.ps1          # build, then all 629 normal tests
+powershell -ExecutionPolicy Bypass -File scripts\test.ps1          # build, then all 647 normal tests
 ```
 
 (`-ExecutionPolicy Bypass` applies to that one command only; it is needed on machines whose policy blocks local scripts.) To run the server and nodes by hand, see [Running the server](docs/DESIGN.md#running-the-server) and [Running a storage node](docs/DESIGN.md#running-a-storage-node).
@@ -135,7 +135,7 @@ Excerpts from real runs on 27 October 2026 (`…` marks lines left out; IDs, por
 - **Crash-safe uploads:** interrupted uploads are finished or undone when the server starts.
 - **Failure detection and repair:** heartbeats, `GET /cluster/status`, and `POST /cluster/repair` with a dry run.
 - **Degraded start:** the server starts with a recorded node down.
-- **Tested:** 629 normal tests and 10 stress tests in 36 plain-Java runners, run by GitHub Actions on Windows, with deliberate-break runs that confirm each safety rule has a test that fails without it ([docs/TESTING.md](docs/TESTING.md)).
+- **Tested:** 647 normal tests and 10 stress tests in 37 plain-Java runners, run by GitHub Actions on Windows, with deliberate-break runs that confirm each safety rule has a test that fails without it ([docs/TESTING.md](docs/TESTING.md)).
 
 The full list, with the class behind each feature, is in [docs/DESIGN.md](docs/DESIGN.md#implemented-features).
 
@@ -151,6 +151,7 @@ The full list, with the class behind each feature, is in [docs/DESIGN.md](docs/D
 8. **Heartbeats: DOWN after 3 failed checks, UP after 1:** one slow answer doesn't mark a node DOWN, and a node that comes back is usable within one 2-second check. The state drives the status and the repair, not uploads or downloads.
 9. **Manual repair with strict trimming rules:** a repair runs only when asked, with a dry run to preview it; extra copies are trimmed only when every node is UP, so 2 verified copies are certain to remain.
 10. **Degraded start with at least 2 of the recorded nodes:** one dead node doesn't keep the cluster down, and recovery never treats a chunk as absent while a node that may hold it is down.
+11. **Requests from other websites are refused:** the Host check stops DNS rebinding, but a plain form on any website can still make the browser POST to `127.0.0.1`, so the server refuses every request other than GET whose `Origin` is not its own, and a storage node refuses any request that carries an `Origin`.
 
 The rules behind each are in [docs/DESIGN.md](docs/DESIGN.md): [Replication](docs/DESIGN.md#replication), [Failure detection and repair](docs/DESIGN.md#failure-detection-and-repair) and [Startup recovery](docs/DESIGN.md#startup-recovery).
 
@@ -176,6 +177,7 @@ In short:
 - **Check-then-act gaps in storage operations.** The no-follow checks on a node's folder and chunk files happen before the read, write or delete, not atomically with it, so a link swapped in between is not detected. The folders above a node's folder are not checked.
 - **Repair is manual.** Each chunk has two copies, so one node can be down, or one copy damaged or lost, without losing data. A lost or damaged copy is made again only when someone calls `POST /cluster/repair`; until then the chunk stays under-replicated, and losing its other copy loses it. Nothing checks copies in the background.
 - **A degraded start needs 2 nodes and leaves some work for later.** The server starts with recorded nodes down if at least 2 answer, but interrupted uploads that a missing node may be part of keep their markers, and a rollback that a down node cannot confirm keeps its marker, until a start with those nodes.
+- **Requests without an `Origin` header are trusted.** The cross-site check stops pages in a browser; a program on this machine sends no `Origin` and is accepted as before, since there is no authentication.
 
 Every limitation, in detail, is in [docs/DESIGN.md](docs/DESIGN.md#known-limitations).
 
@@ -189,7 +191,7 @@ Networked storage nodes, replication, and failure detection and repair are done 
 
 ## API
 
-The server listens on `127.0.0.1` only and answers only requests whose `Host` is `127.0.0.1:<port>` or `localhost:<port>`. Errors are JSON bodies `{"error":"<code>","message":"<fixed sentence>"}`.
+The server listens on `127.0.0.1` only and answers only requests whose `Host` is `127.0.0.1:<port>` or `localhost:<port>`. Errors are JSON bodies `{"error":"<code>","message":"<fixed sentence>"}`. A request other than GET whose `Origin` header is not the server's own (a page on another website) gets `403 cross_origin_refused` and changes nothing.
 
 | Request | Does | Main answers |
 |---|---|---|
@@ -223,4 +225,4 @@ Every request, field and error code is described in [docs/DESIGN.md](docs/DESIGN
 
 \* Phases 1–5 were built before the Git repository was created, so they are all in the initial commit.
 
-The repository layout is in [docs/DESIGN.md](docs/DESIGN.md#repository-structure). Personal learning project; issues and suggestions welcome. Before suggesting a change, run all 36 suites (629 normal tests) and, separately, the 10 stress tests, as described in [docs/TESTING.md](docs/TESTING.md#run-the-tests).
+The repository layout is in [docs/DESIGN.md](docs/DESIGN.md#repository-structure). Personal learning project; issues and suggestions welcome. Before suggesting a change, run all 37 suites (647 normal tests) and, separately, the 10 stress tests, as described in [docs/TESTING.md](docs/TESTING.md#run-the-tests).
