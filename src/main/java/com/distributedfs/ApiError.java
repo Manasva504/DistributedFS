@@ -32,6 +32,8 @@ enum ApiError {
             "This endpoint does not accept this query; /cluster/repair takes only dryRun=true or dryRun=false."),
     HOST_NOT_ALLOWED(403, "host_not_allowed",
             "This server only accepts requests addressed to 127.0.0.1 or localhost."),
+    CROSS_ORIGIN_REFUSED(403, "cross_origin_refused",
+            "This server does not accept requests that change data from another website."),
     NOT_FOUND(404, "not_found",
             "There is no endpoint at this path."),
     FILE_NOT_FOUND(404, "file_not_found",

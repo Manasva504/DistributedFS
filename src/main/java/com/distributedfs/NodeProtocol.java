@@ -49,6 +49,7 @@ final class NodeProtocol {
         BAD_REQUEST(400, "bad_request"),
         INVALID_CHUNK_ID(400, "invalid_chunk_id"),
         HOST_NOT_ALLOWED(403, "host_not_allowed"),
+        CROSS_ORIGIN_REFUSED(403, "cross_origin_refused"),
         NOT_FOUND(404, "not_found"),
         CHUNK_NOT_FOUND(404, "chunk_not_found"),
         METHOD_NOT_ALLOWED(405, "method_not_allowed"),

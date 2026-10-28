@@ -25,6 +25,7 @@ public class ApiErrorTest {
             "400 checksum_mismatch",
             "400 invalid_query",
             "403 host_not_allowed",
+            "403 cross_origin_refused",
             "404 not_found",
             "404 file_not_found",
             "405 method_not_allowed",

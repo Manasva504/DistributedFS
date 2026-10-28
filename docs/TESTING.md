@@ -12,6 +12,7 @@ Each suite is a plain-Java program. It prints `PASS`, `FAIL` or `SKIP` for every
 | `ChecksumServiceTest` | 15 | 1 |
 | `ClusterStatusEndpointTest` | 11 | none |
 | `CrashRecoveryTest` | 8 | 1 |
+| `CrossOriginTest` | 18 | none |
 | `DataDirectoryTest` | 20 | none |
 | `DegradedStartupTest` | 15 | none |
 | `DistributedFsDemoTest` | 18 | 1 |
@@ -44,7 +45,7 @@ Each suite is a plain-Java program. It prints `PASS`, `FAIL` or `SKIP` for every
 | `StorageNodeServerTest` | 6 | none |
 | `StorageNodeTest` | 58 | 1 |
 | `UploadEndpointTest` | 24 | 2 |
-| **Total** | **629** | **10** |
+| **Total** | **647** | **10** |
 
 The simplest way to build and run everything is the script that continuous integration uses. From the repository folder:
 
@@ -59,7 +60,7 @@ Each run compiles into a new temporary folder (never `out` or `out-test`), so cl
 To run the suites by hand instead, from the repository folder:
 
 ```powershell
-foreach ($suite in 'ApiErrorTest', 'ChecksumServiceTest', 'ClusterStatusEndpointTest', 'CrashRecoveryTest',
+foreach ($suite in 'ApiErrorTest', 'ChecksumServiceTest', 'ClusterStatusEndpointTest', 'CrashRecoveryTest', 'CrossOriginTest',
         'DataDirectoryTest', 'DegradedStartupTest', 'DistributedFsDemoTest', 'DistributedFsServerTest', 'DownloadEndpointTest', 'FileChunkerTest',
         'FileIdsTest', 'FileReconstructorTest', 'FileServiceTest', 'FileTreesTest', 'HeartbeatMonitorTest', 'JsonTest',
         'ManifestStoreTest', 'NetworkedRecoveryTest', 'NodeApiTest', 'NodeDataDirectoryTest', 'RemoteClusterTest',
@@ -176,10 +177,17 @@ A run on 27 October 2026, on the same machine, tested milestone M4a (this docume
 - **`scripts\demo.ps1`**, **`scripts\kill-demo.ps1`** and **`scripts\repair-demo.ps1`:** all three printed `RESULT: SUCCESS` and exited with code 0; in the repair demo, node 1 was DOWN 5.1 seconds after it was killed and UP 1.5 seconds after its restart. Excerpts are in the [README](../README.md#what-the-demos-print).
 - **`scripts\bench.ps1`:** 3 runs, all checks passed; the results are in [BENCHMARKS.md](BENCHMARKS.md).
 
+A run on 28 October 2026, on the same machine, tested milestone M4b-1 (the cross-site check on the server and the storage nodes) before it was committed:
+
+- **Normal tests:** `scripts\test.ps1` in Windows PowerShell 5.1: all 37 suites exited with code 0. Of the 647 normal tests, 647 passed, 0 failed and 0 were skipped. The run took about 123 seconds.
+- **Stress tests,** run separately with `scripts\test.ps1 -Stress`: all 10 passed with `-Xmx16m`, in about 17 seconds.
+- **Deliberate-break checks:** 7 checks each broke one rule of the cross-site check in a separate copy of the source, and `CrossOriginTest` detected all 7: the check skipped for `/cluster/repair`; `Origin` compared as a prefix; `Origin: null` accepted; an origin accepted for either `127.0.0.1` or `localhost` whatever the request's Host; `Sec-Fetch-Site` ignored; the check applied to `POST /files` only; the storage node's check removed.
+- **`scripts\demo.ps1`**, **`scripts\kill-demo.ps1`** and **`scripts\repair-demo.ps1`:** all three printed `RESULT: SUCCESS` and exited with code 0, and none left a process or folder behind.
+
 ## Running tests and contributing
 
 Personal learning project; issues and suggestions welcome.
 
 - Each `*Test` class is a small test runner with its own `main` method; no test framework is used. Every test that touches files runs in its own temporary folder, which is deleted afterwards, and a suite exits with code 1 if any test fails. HTTP tests start servers on free ports chosen at run time.
 - Several classes have package-private test hooks, such as `FileReconstructor.openChunk`, `StorageNode.openForReading`, `StorageNode.deleteChunkFile`, `ManifestStore.writeContent` and `ManifestStore.moveIntoPlace`, `FileApiHandler.respondHealth` and `FileApiHandler.prepareDownload`, and `DistributedFsDemo.createNode`. Tests in the same package override them to simulate disk failures, corrupted data and crashes.
-- Before suggesting a change, rebuild and run all 36 suites (629 normal tests) and, separately, the 10 stress tests, using the commands in [Run the tests](#run-the-tests).
+- Before suggesting a change, rebuild and run all 37 suites (647 normal tests) and, separately, the 10 stress tests, using the commands in [Run the tests](#run-the-tests).

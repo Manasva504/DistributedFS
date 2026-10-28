@@ -35,6 +35,16 @@ import java.util.concurrent.atomic.AtomicInteger;
  * A request target in absolute form ({@code GET http://host/path}) names its own host, so it is
  * refused the same way.
  *
+ * <p><b>Cross-site check.</b> The Host check does not stop a page on another website from making
+ * the browser send a request here: a plain form POST to {@code http://127.0.0.1:<port>/cluster/repair}
+ * carries the right Host. So every request other than GET (today {@code POST /files} and
+ * {@code POST /cluster/repair}) is refused with 403 {@code cross_origin_refused}, right after the
+ * Host check, if it carries an {@code Origin} other than this server's own or a
+ * {@code Sec-Fetch-Site} other than {@code same-origin} or {@code none}
+ * ({@link #isSameOriginOrNoBrowser}). Browsers send {@code Origin} with every cross-site POST;
+ * clients that are not browsers send neither header and are not affected. GET requests change
+ * nothing, and the browser's same-origin rule keeps other sites from reading their answers.
+ *
  * <p><b>Uploads</b> ({@code POST /files}). The body is the file's raw bytes. Before any of it is
  * stored, the request must have exactly one {@code Content-Type: application/octet-stream} (415
  * otherwise), an optional {@code X-Content-SHA256} of exactly 64 hexadecimal characters (400
@@ -168,6 +178,11 @@ class FileApiHandler implements HttpHandler {
             sendError(exchange, ApiError.HOST_NOT_ALLOWED, null);
             return;
         }
+        if (!"GET".equals(exchange.getRequestMethod())
+                && !isSameOriginOrNoBrowser(exchange.getRequestHeaders(), exchange.getRequestHeaders().getFirst("Host"))) {
+            sendError(exchange, ApiError.CROSS_ORIGIN_REFUSED, null);
+            return;
+        }
         // The raw path, never decoded, so encoded tricks such as %2F cannot change the route.
         String path = target.getRawPath();
         if (HEALTH_PATH.equals(path)) {
@@ -272,6 +287,27 @@ class FileApiHandler implements HttpHandler {
         String portText = value.substring(colon + 1);
         boolean knownHost = host.equals("127.0.0.1") || host.toLowerCase(Locale.ROOT).equals("localhost");
         return knownHost && portText.equals(Integer.toString(port));
+    }
+
+    /**
+     * The cross-site check for every request other than GET, made after {@link #isAllowedHost}
+     * has accepted {@code host}. A request passes if it has no {@code Origin} header, or exactly one
+     * whose value is exactly {@code http://<host>}, the request's own Host value; and if it has no
+     * {@code Sec-Fetch-Site} header, or exactly one that is {@code same-origin} or {@code none}.
+     * Everything else is a request a page on another site made the browser send (or one that
+     * looks like it), including {@code Origin: null}, another port, {@code https:}, a trailing
+     * slash, and a {@code localhost} origin sent to a {@code 127.0.0.1} Host.
+     *
+     * <p>Clients that are not browsers, such as curl or PowerShell, send neither header and pass.
+     */
+    static boolean isSameOriginOrNoBrowser(Headers headers, String host) {
+        List<String> origins = headers.get("Origin");
+        if (origins != null && (origins.size() != 1 || host == null || !origins.get(0).equals("http://" + host))) {
+            return false;
+        }
+        List<String> fetchSites = headers.get("Sec-Fetch-Site");
+        return fetchSites == null
+                || (fetchSites.size() == 1 && (fetchSites.get(0).equals("same-origin") || fetchSites.get(0).equals("none")));
     }
 
     // ---------------------------------------------------------------------

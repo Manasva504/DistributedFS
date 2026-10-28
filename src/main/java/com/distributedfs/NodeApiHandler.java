@@ -48,9 +48,12 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p><b>Checks before routing</b>, as in {@link FileApiHandler}: exactly one Host header naming
  * {@code 127.0.0.1} or {@code localhost} with this node's port (403 {@code host_not_allowed}
  * otherwise, also for absolute request targets), so a web page cannot reach the node through DNS
- * rebinding. Routes are matched on the raw path, never decoded: a chunk ID containing {@code %} or
- * {@code /}, or breaking any {@link StorageNode} ID rule, is 400 {@code invalid_chunk_id} before
- * anything touches the disk.
+ * rebinding. A request from a web page is refused next, with 403 {@code cross_origin_refused}:
+ * any {@code Origin} header, or a {@code Sec-Fetch-Site} other than {@code none}, because a page
+ * on another site could otherwise make the browser send a store, delete or sweep that passes the
+ * Host check, and no browser has any reason to call a node. Routes are matched on the raw path,
+ * never decoded: a chunk ID containing {@code %} or {@code /}, or breaking any {@link StorageNode}
+ * ID rule, is 400 {@code invalid_chunk_id} before anything touches the disk.
  *
  * <p><b>One operation at a time.</b> A StorageNode must be used by one thread at a time, and any
  * local process can call a node, so every chunk operation runs under one node-wide lock, including
@@ -143,12 +146,30 @@ final class NodeApiHandler implements HttpHandler {
         }
     }
 
+    /**
+     * True for a request that no web page made: no {@code Origin} header at all, and no
+     * {@code Sec-Fetch-Site} header other than exactly one {@code none}. Only the server's
+     * {@link RemoteStorageNode} is meant to call a node, and the JDK's HTTP client sends neither.
+     */
+    static boolean isNotFromBrowserPage(Headers headers) {
+        if (headers.containsKey("Origin")) {
+            return false;
+        }
+        List<String> fetchSites = headers.get("Sec-Fetch-Site");
+        return fetchSites == null || (fetchSites.size() == 1 && fetchSites.get(0).equals("none"));
+    }
+
     private void dispatch(HttpExchange exchange, RequestLog log) throws IOException {
         URI target = exchange.getRequestURI();
         if (!FileApiHandler.isAllowedHost(exchange.getRequestHeaders().get("Host"), port) || target.isAbsolute()
                 || target.getRawAuthority() != null) {
             log.route = "(host not allowed)";
             sendError(exchange, NodeProtocol.Error.HOST_NOT_ALLOWED, null, log);
+            return;
+        }
+        if (!isNotFromBrowserPage(exchange.getRequestHeaders())) {
+            log.route = "(cross-origin refused)";
+            sendError(exchange, NodeProtocol.Error.CROSS_ORIGIN_REFUSED, null, log);
             return;
         }
         String path = target.getRawPath();
