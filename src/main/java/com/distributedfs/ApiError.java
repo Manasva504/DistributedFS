@@ -30,6 +30,8 @@ enum ApiError {
             "The uploaded data does not match the X-Content-SHA256 header, so nothing was stored."),
     INVALID_QUERY(400, "invalid_query",
             "This endpoint does not accept this query; /cluster/repair takes only dryRun=true or dryRun=false."),
+    INVALID_FILE_NAME(400, "invalid_file_name",
+            "The X-File-Name header must be a percent-encoded UTF-8 file name of 1 to 255 characters without a slash."),
     HOST_NOT_ALLOWED(403, "host_not_allowed",
             "This server only accepts requests addressed to 127.0.0.1 or localhost."),
     CROSS_ORIGIN_REFUSED(403, "cross_origin_refused",
@@ -55,7 +57,9 @@ enum ApiError {
     STORAGE_ERROR(500, "storage_error",
             "The storage nodes could not complete the request."),
     INTERNAL_ERROR(500, "internal_error",
-            "The server hit an unexpected error.");
+            "The server hit an unexpected error."),
+    CONSOLE_UNAVAILABLE(503, "console_unavailable",
+            "The web console's files were not found when this server started.");
 
     private final int status;
     private final String code;

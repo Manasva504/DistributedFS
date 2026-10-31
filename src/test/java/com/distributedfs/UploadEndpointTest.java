@@ -109,7 +109,7 @@ public class UploadEndpointTest {
         runTest("a connection reset during the upload leaves nothing behind", UploadEndpointTest::resetDuringUpload);
 
         // Routing and Host
-        runTest("other methods on /files are 405 with Allow: POST; POST under /files/ is 405 with Allow: GET",
+        runTest("other methods on /files are 405 with Allow: GET, POST; POST under /files/ is 405 with Allow: GET",
                 UploadEndpointTest::routing);
         runTest("a bad Host is 403 before the upload is looked at", UploadEndpointTest::badHostIsRefused);
 
@@ -157,7 +157,7 @@ public class UploadEndpointTest {
             FileManifest manifest = server.manifests().read(fileId).orElseThrow();
             checkEquals(new FileManifest(fileId, 10, sha256(data), 4, 3, chunkSha256s(data, 4)), manifest, "the stored manifest");
             checkEquals("{\"fileId\":\"" + fileId + "\",\"size\":10,\"sha256\":\"" + sha256(data)
-                    + "\",\"chunkSize\":4,\"chunkCount\":3}", response.body(), "the JSON body");
+                    + "\",\"chunkSize\":4,\"chunkCount\":3,\"name\":null}", response.body(), "the JSON body");
             checkEquals("application/json; charset=utf-8", response.headers().firstValue("Content-Type").orElse(null),
                     "Content-Type");
             checkEquals("nosniff", response.headers().firstValue("X-Content-Type-Options").orElse(null), "nosniff");
@@ -456,11 +456,13 @@ public class UploadEndpointTest {
 
     private static void routing(Path tempDir) throws Exception {
         withServer(tempDir, 1024, 4, server -> {
-            for (String method : List.of("GET", "PUT", "DELETE", "PATCH", "OPTIONS")) {
+            // GET /files lists the files (milestone M4b-2; FilesListEndpointTest covers it), so the
+            // Allow header names both methods.
+            for (String method : List.of("PUT", "DELETE", "PATCH", "OPTIONS")) {
                 RawResponse response = exchange(server, head(method, "/files", server, "Content-Length: 0\r\n"),
                         new byte[0]);
                 checkErrorResponse(response, ApiError.METHOD_NOT_ALLOWED, server, method + " /files");
-                checkEquals("POST", response.header("allow"), method + " /files: Allow");
+                checkEquals("GET, POST", response.header("allow"), method + " /files: Allow");
             }
             try (Socket socket = connect(server)) {
                 socket.getOutputStream().write(head("HEAD", "/files", server, "").getBytes(StandardCharsets.ISO_8859_1));
@@ -468,7 +470,7 @@ public class UploadEndpointTest {
                 byte[] all = socket.getInputStream().readAllBytes();
                 String text = new String(all, StandardCharsets.ISO_8859_1);
                 check(text.startsWith("HTTP/1.1 405 "), "HEAD /files: " + text);
-                checkContains(text.toLowerCase(Locale.ROOT), "\r\nallow: post\r\n");
+                checkContains(text.toLowerCase(Locale.ROOT), "\r\nallow: get, post\r\n");
                 check(text.endsWith("\r\n\r\n"), "HEAD /files has no body: " + text);
             }
             // A path under /files/ names a file, which only GET reads: POST there is never an upload.
@@ -592,7 +594,7 @@ public class UploadEndpointTest {
         }
 
         @Override
-        FileManifest store(Path body, Path workspace, String expectedSha256) throws IOException {
+        FileManifest store(Path body, Path workspace, String expectedSha256, String name) throws IOException {
             Exception failure = storeFailure;
             if (failure instanceof IOException ioFailure) {
                 throw ioFailure;
@@ -600,7 +602,7 @@ public class UploadEndpointTest {
             if (failure instanceof RuntimeException runtimeFailure) {
                 throw runtimeFailure;
             }
-            return super.store(body, workspace, expectedSha256);
+            return super.store(body, workspace, expectedSha256, name);
         }
     }
 

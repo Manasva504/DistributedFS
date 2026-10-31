@@ -47,6 +47,8 @@ final class HeartbeatMonitor implements AutoCloseable {
     private final PrintStream err;
     private final NodeHealth[] states;
     private ScheduledExecutorService executor;
+    /** Where state changes are also recorded for the console's activity feed; null for none. */
+    private volatile ClusterEvents events;
 
     /**
      * @param answeredAtStart for each node, whether it answered when the server started
@@ -70,6 +72,11 @@ final class HeartbeatMonitor implements AutoCloseable {
             states[i] = answeredAtStart.get(i) ? new NodeHealth(i, State.UP, now, 0)
                     : new NodeHealth(i, State.DOWN, null, failuresForDown);
         }
+    }
+
+    /** Records every later UP and DOWN change in {@code events} too (the server sets this before it starts the thread). */
+    void recordEventsIn(ClusterEvents events) {
+        this.events = Objects.requireNonNull(events, "events must not be null");
     }
 
     /** Starts the heartbeat thread: the first round of checks after one interval, then one interval after each round. */
@@ -113,6 +120,10 @@ final class HeartbeatMonitor implements AutoCloseable {
             states[index] = new NodeHealth(index, State.UP, clock.instant(), 0);
             if (before.state() == State.DOWN) {
                 err.println("Node " + index + " (" + nodes.get(index).describe() + ") is UP again");
+                ClusterEvents log = events;
+                if (log != null) {
+                    log.nodeUp(index);
+                }
             }
             return;
         }
@@ -122,6 +133,10 @@ final class HeartbeatMonitor implements AutoCloseable {
         if (before.state() == State.UP && state == State.DOWN) {
             err.println("Warning: node " + index + " (" + nodes.get(index).describe() + ") is DOWN after " + failures
                     + " failed health checks in a row (last: " + failure + ")");
+            ClusterEvents log = events;
+            if (log != null) {
+                log.nodeDown(index, failures);
+            }
         }
     }
 

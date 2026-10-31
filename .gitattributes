@@ -2,3 +2,5 @@
 # overriding core.autocrlf so Windows and other systems see identical files.
 * text=auto eol=lf
 *.java text eol=lf
+# Screenshots are binary: never convert their line endings.
+*.png binary

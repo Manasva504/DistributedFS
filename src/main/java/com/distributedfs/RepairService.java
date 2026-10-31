@@ -14,6 +14,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 
 /**
@@ -66,6 +67,8 @@ final class RepairService {
     private final HeartbeatMonitor monitor;
     private final PrintStream err;
     private final AtomicBoolean running = new AtomicBoolean();
+    /** Told about every finished repair and dry run (the web console); null for none. */
+    private volatile Consumer<RepairReport> listener;
 
     RepairService(StorageCluster cluster, ManifestStore manifests, FileService files, Path tmpDir,
                   HeartbeatMonitor monitor, PrintStream err) {
@@ -88,10 +91,37 @@ final class RepairService {
             throw new RepairInProgressException();
         }
         try {
-            return new Run(dryRun).run();
+            RepairReport report = new Run(dryRun).run();
+            Consumer<RepairReport> told = listener;
+            if (told != null) {
+                told.accept(report);
+            }
+            return report;
         } finally {
             running.set(false);
         }
+    }
+
+    /** Tells {@code listener} about every later finished repair and dry run. It must be quick and do no I/O. */
+    void setListener(Consumer<RepairReport> listener) {
+        this.listener = Objects.requireNonNull(listener, "listener must not be null");
+    }
+
+    /**
+     * Which of a chunk's good copies a repair deletes to bring it down to {@code replicas}: those on
+     * the nodes with the most chunks, the higher index first on a tie. Empty if there are no extras.
+     * The web console ({@link ConsoleApi}) uses the same rule to mark copies a repair would remove.
+     *
+     * @param holders       the nodes holding a good copy
+     * @param chunksPerNode how many chunks each node holds
+     */
+    static List<Integer> trimVictims(List<Integer> holders, int[] chunksPerNode, int replicas) {
+        if (holders.size() <= replicas) {
+            return List.of();
+        }
+        List<Integer> extras = new ArrayList<>(holders);
+        extras.sort((a, b) -> chunksPerNode[b] != chunksPerNode[a] ? chunksPerNode[b] - chunksPerNode[a] : b - a);
+        return List.copyOf(extras.subList(0, holders.size() - replicas));
     }
 
     /** One run's state and counts. */
@@ -300,9 +330,7 @@ final class RepairService {
                         trimSkipped = true;
                         return;
                     }
-                    List<Integer> extras = new ArrayList<>(good);
-                    extras.sort((a, b) -> chunksPerNode[b] != chunksPerNode[a] ? chunksPerNode[b] - chunksPerNode[a] : b - a);
-                    for (int node : extras.subList(0, good.size() - replicas)) {
+                    for (int node : trimVictims(good, chunksPerNode, replicas)) {
                         if (!dryRun) {
                             try {
                                 cluster.node(node).deleteChunk(chunkId);

@@ -93,6 +93,13 @@ class FileService {
     private final IdGenerator ids;
     private final PrintStream err;
     private final Object storageLock = new Object();
+    /** Told about every committed upload (the web console's activity feed); null for none. */
+    private volatile UploadListener uploadListener;
+
+    /** Told once per committed upload, with the number of chunk copies stored. Must be quick and do no I/O. */
+    interface UploadListener {
+        void committed(FileManifest manifest, int copies);
+    }
 
     FileService(StorageCluster cluster, ManifestStore manifests, Path tmpDir, int chunkSize, long maxUploadBytes,
                 PrintStream err) {
@@ -111,6 +118,11 @@ class FileService {
         }
         this.chunkSize = chunkSize;
         this.maxUploadBytes = maxUploadBytes;
+    }
+
+    /** Tells {@code listener} about every later committed upload (the server sets this before it listens). */
+    void setUploadListener(UploadListener listener) {
+        this.uploadListener = Objects.requireNonNull(listener, "listener must not be null");
     }
 
     /** The largest upload accepted, in bytes. */
@@ -167,6 +179,17 @@ class FileService {
      * @throws IOException if reading the body or writing chunks in the workspace fails (nothing stored)
      */
     FileManifest store(Path body, Path workspace, String expectedSha256) throws IOException {
+        return store(body, workspace, expectedSha256, null);
+    }
+
+    /**
+     * As {@link #store(Path, Path, String)}, with the file's original name ({@link FileNames#isValid}),
+     * or null for none. A name is stored in the manifest (format 3); without one the manifest is format 2.
+     */
+    FileManifest store(Path body, Path workspace, String expectedSha256, String name) throws IOException {
+        if (name != null && !FileNames.isValid(name)) {
+            throw new IllegalArgumentException("name is not a valid file name");
+        }
         Objects.requireNonNull(body, "body must not be null");
         Objects.requireNonNull(workspace, "workspace must not be null");
 
@@ -197,7 +220,7 @@ class FileService {
             chunkSha256s.add(checksums.calculateSha256(chunk));
         }
         synchronized (storageLock) {
-            return storeLocked(chunks, size, sha256, chunkSha256s);
+            return storeLocked(chunks, size, sha256, chunkSha256s, name);
         }
     }
 
@@ -302,10 +325,10 @@ class FileService {
     }
 
     /** Steps 3 and 4 of the class comment. Must be called holding the storage lock. */
-    private FileManifest storeLocked(List<Path> chunks, long size, String sha256, List<String> chunkSha256s)
+    private FileManifest storeLocked(List<Path> chunks, long size, String sha256, List<String> chunkSha256s, String name)
             throws FileServiceException {
         String fileId = unusedFileId();
-        FileManifest manifest = new FileManifest(fileId, size, sha256, chunkSize, chunks.size(), chunkSha256s);
+        FileManifest manifest = new FileManifest(fileId, size, sha256, chunkSize, chunks.size(), chunkSha256s, name);
         try {
             manifests.createPending(new ManifestStore.PendingUpload(fileId, chunks.size()));
         } catch (IOException | RuntimeException e) {
@@ -314,11 +337,13 @@ class FileService {
 
         List<String> storedChunkIds = new ArrayList<>();
         String storing = null;
+        int copies = 0;
         try {
             for (int i = 0; i < chunks.size(); i++) {
                 storing = FileIds.chunkId(fileId, i);
                 StorageCluster.StoreResult stored = cluster.storeReplicated(storing, chunks.get(i));
                 storedChunkIds.add(storing); // recorded only once every copy is confirmed
+                copies += stored.copies().size();
                 if (!stored.skipped().isEmpty()) {
                     List<String> skipped = new ArrayList<>();
                     for (int node : stored.skipped()) {
@@ -352,6 +377,10 @@ class FileService {
         } catch (IOException | RuntimeException e) {
             err.println("Warning: upload " + fileId + " is stored, but its pending-upload marker could not be"
                     + " deleted and was left in place: " + e);
+        }
+        UploadListener listener = uploadListener;
+        if (listener != null) {
+            listener.committed(manifest, copies);
         }
         return manifest;
     }

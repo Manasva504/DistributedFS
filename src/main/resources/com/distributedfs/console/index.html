@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>DistributedFS console</title>
+<link rel="stylesheet" href="/console/console.css">
+<script src="/console/console.js" defer></script>
+</head>
+<body>
+<div class="backdrop" aria-hidden="true">
+  <span class="blob blob-green"></span>
+  <span class="blob blob-peach"></span>
+  <span class="blob blob-blue"></span>
+  <span class="blob blob-green-low"></span>
+</div>
+
+<header class="topbar glass">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <rect x="4" y="3.5" width="16" height="5" rx="2.5"></rect>
+        <rect x="4" y="9.5" width="16" height="5" rx="2.5"></rect>
+        <rect x="4" y="15.5" width="16" height="5" rx="2.5"></rect>
+      </svg>
+    </span>
+    <div>
+      <div class="brand-name">DistributedFS</div>
+      <div class="brand-address mono" id="server-address">127.0.0.1</div>
+    </div>
+  </div>
+  <div class="health" role="status" aria-live="polite">
+    <span class="health-dot" id="health-dot" aria-hidden="true"></span>
+    <strong id="health-title">Connecting</strong>
+    <span class="health-reason" id="health-reason">Asking the server for the cluster status</span>
+  </div>
+  <div class="cluster-facts" id="cluster-facts"></div>
+  <div class="actions">
+    <button type="button" class="btn" id="dry-run">Dry run</button>
+    <button type="button" class="btn btn-primary" id="repair">Repair</button>
+  </div>
+</header>
+
+<main class="layout">
+  <section class="nodes" aria-labelledby="nodes-title">
+    <h2 class="section-label" id="nodes-title">Storage nodes</h2>
+    <div class="node-cards" id="node-cards"></div>
+  </section>
+
+  <section class="chunk-map glass" aria-labelledby="map-title">
+    <h2 class="panel-title" id="map-title">Chunk map</h2>
+    <p class="muted" id="map-subtitle">No file selected</p>
+    <ul class="legend" aria-label="Legend">
+      <li><span class="swatch swatch-copy" aria-hidden="true"></span>copy</li>
+      <li><span class="swatch swatch-new" aria-hidden="true"></span>new (repair)</li>
+      <li><span class="swatch swatch-unreachable" aria-hidden="true"></span>unreachable</li>
+      <li><span class="swatch swatch-extra" aria-hidden="true"></span>extra</li>
+    </ul>
+    <div class="map-scroll" id="map-scroll"></div>
+    <p class="muted map-more" id="map-more" hidden></p>
+  </section>
+
+  <div class="side">
+    <section class="files glass" aria-labelledby="files-title">
+      <h2 class="panel-title" id="files-title">Files</h2>
+      <ul class="file-list" id="file-list"></ul>
+      <p class="muted files-note" id="files-note" hidden></p>
+      <div class="dropzone" id="dropzone">
+        <span class="drop-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 16V4"></path><path d="M7 9l5-5 5 5"></path><path d="M5 20h14"></path>
+          </svg>
+        </span>
+        <p class="drop-title">Drop a file to upload</p>
+        <p class="muted" id="drop-hint">Split into chunks, 2 copies each</p>
+        <button type="button" class="btn" id="choose-file">Choose file</button>
+        <input type="file" id="file-input" class="visually-hidden" tabindex="-1" aria-hidden="true">
+        <p class="upload-status" id="upload-status" role="status" aria-live="polite"></p>
+      </div>
+    </section>
+
+    <section class="activity glass" aria-labelledby="activity-title">
+      <h2 class="panel-title" id="activity-title">Activity</h2>
+      <ol class="activity-list" id="activity"></ol>
+      <p class="muted" id="activity-empty">Nothing has happened since the server started.</p>
+    </section>
+  </div>
+</main>
+
+<div class="sheet-backdrop" id="sheet-backdrop" hidden></div>
+<div class="sheet glass" id="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title" hidden>
+  <div class="sheet-head">
+    <div>
+      <p class="sheet-kicker" id="sheet-kicker">Repair finished</p>
+      <h2 class="sheet-title" id="sheet-title">Nothing to repair</h2>
+    </div>
+    <button type="button" class="icon-btn" id="sheet-close">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+        <path d="M6 6l12 12"></path><path d="M18 6L6 18"></path>
+      </svg>
+      <span class="visually-hidden">Close</span>
+    </button>
+  </div>
+  <dl class="sheet-stats" id="sheet-stats"></dl>
+  <ul class="sheet-notes" id="sheet-notes"></ul>
+</div>
+</body>
+</html>

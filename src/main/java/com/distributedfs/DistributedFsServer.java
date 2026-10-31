@@ -204,14 +204,18 @@ public final class DistributedFsServer {
     private final int port;
     private final List<RemoteStorageNode> remoteNodes;
     private final HeartbeatMonitor monitor;
+    private final PlacementSnapshot placement;
+    private final ClusterEvents events;
     private boolean stopped = false;
 
     private DistributedFsServer(Config config, DataDirectory dataDirectory, StorageCluster cluster,
                                 ManifestStore manifests, FileService files, HttpServer httpServer,
                                 ThreadPoolExecutor executor, List<RemoteStorageNode> remoteNodes,
-                                HeartbeatMonitor monitor) {
+                                HeartbeatMonitor monitor, PlacementSnapshot placement, ClusterEvents events) {
         this.remoteNodes = List.copyOf(remoteNodes);
         this.monitor = monitor;
+        this.placement = placement;
+        this.events = events;
         this.config = config;
         this.dataDirectory = dataDirectory;
         this.cluster = cluster;
@@ -430,6 +434,23 @@ public final class DistributedFsServer {
             RepairService repair = new RepairService(cluster, manifests, files, dataDirectory.tmpDir(), monitor,
                     config.err());
             ClusterApi clusterApi = new ClusterApi(monitor, repair, cluster.replicas());
+            // The web console: its activity feed, its shared view of the copies, and its files.
+            ClusterEvents events = new ClusterEvents(Clock.systemUTC());
+            PlacementSnapshot placement = new PlacementSnapshot(nodes, monitor, PlacementSnapshot.DEFAULT_MAX_AGE_MILLIS,
+                    Clock.systemUTC());
+            monitor.recordEventsIn(events);
+            files.setUploadListener((manifest, copies) -> {
+                events.uploadFinished(manifest, copies);
+                placement.invalidate();
+            });
+            repair.setListener(report -> {
+                events.repairFinished(report);
+                if (!report.dryRun()) {
+                    placement.invalidate();
+                }
+            });
+            ConsoleApi console = new ConsoleApi(manifests, placement, events, cluster.replicas());
+            ConsoleAssets assets = ConsoleAssets.load(config.err());
             monitor.start();
 
             executor = newExecutor(config);
@@ -437,12 +458,12 @@ public final class DistributedFsServer {
             httpServer.setExecutor(executor);
             int actualPort = httpServer.getAddress().getPort();
             httpServer.createContext("/", handlerFactory == null
-                    ? new FileApiHandler(actualPort, config.err(), files, clusterApi)
+                    ? new FileApiHandler(actualPort, config.err(), files, clusterApi, console, assets)
                     : handlerFactory.create(actualPort, config.err(), files));
             httpServer.start();
 
             DistributedFsServer server = new DistributedFsServer(config, dataDirectory, cluster, manifests,
-                    files, httpServer, executor, remoteNodes, monitor);
+                    files, httpServer, executor, remoteNodes, monitor, placement, events);
             if (dataDirectory.newlyInitialized()) {
                 config.out().println("Initialized a new data directory: " + dataDirectory.root());
             }
@@ -459,6 +480,9 @@ public final class DistributedFsServer {
                     + " of every chunk, each on a different node");
             config.out().println("DistributedFS server listening on http://127.0.0.1:" + actualPort
                     + "/ (data directory: " + dataDirectory.root() + ")");
+            if (handlerFactory == null && assets.available()) {
+                config.out().println("Web console: http://127.0.0.1:" + actualPort + "/");
+            }
             return server;
         } catch (Throwable e) {
             shutDown(httpServer, executor, dataDirectory, 0, config.err(), e);
@@ -597,6 +621,16 @@ public final class DistributedFsServer {
     /** The heartbeat that tracks which nodes are UP, for tests that run a check at once. */
     HeartbeatMonitor monitor() {
         return monitor;
+    }
+
+    /** The web console's shared view of the copies, for tests of its sharing and refresh. */
+    PlacementSnapshot placement() {
+        return placement;
+    }
+
+    /** The web console's activity feed, for tests. */
+    ClusterEvents events() {
+        return events;
     }
 
     /**
