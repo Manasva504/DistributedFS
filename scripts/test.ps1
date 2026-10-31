@@ -54,7 +54,9 @@ try {
         $code = $LASTEXITCODE
         if ($code -ne 0) { Write-Host "Compilation of $($part.Src) failed (exit $code)"; exit 1 }
     }
-    $classPath = "$mainOut;$testOut"
+    # The web console's files are read from the class path (javac copies nothing), so the
+    # resources folder is on it, as for the server itself.
+    $classPath = "$mainOut;$testOut;" + (Join-Path $root 'src\main\resources')
 
     # With powershell -File, "-Suite A,B" arrives as the single string "A,B", so split it here.
     $Suite = @($Suite | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })

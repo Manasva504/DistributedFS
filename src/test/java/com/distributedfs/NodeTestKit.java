@@ -274,6 +274,8 @@ final class NodeTestKit {
         final AtomicInteger stores = new AtomicInteger();
         /** Every storeChunk call, including those that fail. */
         final AtomicInteger storeAttempts = new AtomicInteger();
+        /** Every listEntries call, including those that fail. */
+        final AtomicInteger listings = new AtomicInteger();
 
         ControlledNode(Path dir) throws IOException {
             node = new StorageNode(dir);
@@ -344,6 +346,7 @@ final class NodeTestKit {
 
         @Override
         public List<ChunkStore.Entry> listEntries() throws IOException {
+            listings.incrementAndGet();
             requireUp();
             return node.listEntries();
         }

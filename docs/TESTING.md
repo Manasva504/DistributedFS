@@ -10,7 +10,10 @@ Each suite is a plain-Java program. It prints `PASS`, `FAIL` or `SKIP` for every
 |---|---|---|
 | `ApiErrorTest` | 5 | none |
 | `ChecksumServiceTest` | 15 | 1 |
+| `ClusterEventsTest` | 12 | none |
 | `ClusterStatusEndpointTest` | 11 | none |
+| `ConsoleAssetsTest` | 13 | none |
+| `ConsoleEndpointTest` | 15 | none |
 | `CrashRecoveryTest` | 8 | 1 |
 | `CrossOriginTest` | 18 | none |
 | `DataDirectoryTest` | 20 | none |
@@ -20,15 +23,19 @@ Each suite is a plain-Java program. It prints `PASS`, `FAIL` or `SKIP` for every
 | `DownloadEndpointTest` | 26 | 1 |
 | `FileChunkerTest` | 18 | none |
 | `FileIdsTest` | 12 | none |
+| `FileNamesEndpointTest` | 10 | none |
+| `FileNamesTest` | 14 | none |
 | `FileReconstructorTest` | 15 | 1 |
 | `FileServiceTest` | 34 | none |
 | `FileTreesTest` | 5 | none |
+| `FilesListEndpointTest` | 16 | none |
 | `HeartbeatMonitorTest` | 14 | none |
 | `JsonTest` | 8 | none |
 | `ManifestStoreTest` | 28 | none |
 | `NetworkedRecoveryTest` | 8 | none |
 | `NodeApiTest` | 26 | none |
 | `NodeDataDirectoryTest` | 11 | none |
+| `PlacementEndpointTest` | 14 | none |
 | `RemoteClusterTest` | 10 | none |
 | `RemoteServerTest` | 11 | none |
 | `RemoteStorageNodeTest` | 20 | 1 |
@@ -45,7 +52,7 @@ Each suite is a plain-Java program. It prints `PASS`, `FAIL` or `SKIP` for every
 | `StorageNodeServerTest` | 6 | none |
 | `StorageNodeTest` | 58 | 1 |
 | `UploadEndpointTest` | 24 | 2 |
-| **Total** | **647** | **10** |
+| **Total** | **741** | **10** |
 
 The simplest way to build and run everything is the script that continuous integration uses. From the repository folder:
 
@@ -60,24 +67,27 @@ Each run compiles into a new temporary folder (never `out` or `out-test`), so cl
 To run the suites by hand instead, from the repository folder:
 
 ```powershell
-foreach ($suite in 'ApiErrorTest', 'ChecksumServiceTest', 'ClusterStatusEndpointTest', 'CrashRecoveryTest', 'CrossOriginTest',
+foreach ($suite in 'ApiErrorTest', 'ChecksumServiceTest', 'ClusterEventsTest', 'ClusterStatusEndpointTest', 'ConsoleAssetsTest',
+        'ConsoleEndpointTest', 'CrashRecoveryTest', 'CrossOriginTest',
         'DataDirectoryTest', 'DegradedStartupTest', 'DistributedFsDemoTest', 'DistributedFsServerTest', 'DownloadEndpointTest', 'FileChunkerTest',
-        'FileIdsTest', 'FileReconstructorTest', 'FileServiceTest', 'FileTreesTest', 'HeartbeatMonitorTest', 'JsonTest',
-        'ManifestStoreTest', 'NetworkedRecoveryTest', 'NodeApiTest', 'NodeDataDirectoryTest', 'RemoteClusterTest',
+        'FileIdsTest', 'FileNamesEndpointTest', 'FileNamesTest', 'FileReconstructorTest', 'FileServiceTest', 'FileTreesTest', 'FilesListEndpointTest', 'HeartbeatMonitorTest', 'JsonTest',
+        'ManifestStoreTest', 'NetworkedRecoveryTest', 'NodeApiTest', 'NodeDataDirectoryTest', 'PlacementEndpointTest', 'RemoteClusterTest',
         'RemoteServerTest', 'RemoteStorageNodeTest', 'RepairEndpointTest', 'RepairServiceTest',
         'ReplicatedClusterTest', 'ReplicatedRecoveryTest',
         'ReplicatedServerTest',
         'StaleTempFilesTest', 'StalledRequestTest', 'StallWatchTest', 'StartupRecoveryTest',
         'StorageClusterTest', 'StorageNodeServerTest', 'StorageNodeTest', 'UploadEndpointTest') {
-    java -cp "out;out-test" "com.distributedfs.$suite"
+    java -cp "out;out-test;src\main\resources" "com.distributedfs.$suite"
 }
 ```
 
 Or run one suite, for example:
 
 ```powershell
-java -cp "out;out-test" com.distributedfs.UploadEndpointTest
+java -cp "out;out-test;src\main\resources" com.distributedfs.UploadEndpointTest
 ```
+
+`src\main\resources` holds the web console's files, which the server reads from the class path; without it, `ConsoleEndpointTest` and `ConsoleAssetsTest` fail and the server prints a warning in the other suites.
 
 Some tests are reported as `SKIP` instead of passing when the machine can't run them:
 
@@ -103,6 +113,35 @@ java -Xmx16m -cp "out;out-test" com.distributedfs.RemoteStorageNodeTest --stress
 `UploadEndpointTest --stress` uploads exactly 100 MiB and then four 20 MiB files at once. `RemoteStorageNodeTest --stress` stores one 64 MiB chunk on a storage node over HTTP and retrieves it again, with the node and its client in the same 16 MiB heap. `CrashRecoveryTest --stress` kills a child process partway through a 64 MiB upload and passes `-Xmx16m` to that child itself. `DownloadEndpointTest --stress` uploads 100 MiB and downloads it again, checking the SHA-256 of the bytes as they arrive.
 
 In PowerShell, keep the quotes around `"out;out-test"`: an unquoted `;` ends the command.
+
+## Checking the web console
+
+The Java suites test the console's endpoints, headers and files, but not the page in a browser. `scripts\console-smoke.ps1` does that, by hand:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\console-smoke.ps1
+```
+
+It uses the Chrome or Edge already installed (standard paths; `-Browser <path>` for another one; nothing is downloaded), starts three nodes and the server, uploads two files, and then:
+
+- checks the headers of `GET /` and the two asset paths (exact Content-Security-Policy, `nosniff`, `X-Frame-Options: DENY`, `Cache-Control: no-store`, content types), and that a `POST /cluster/repair` with a foreign `Origin` is refused;
+- loads the page in headless mode and checks the DOM after its scripts ran: they polled the API (`data-console-ready`), no JavaScript error or Content-Security-Policy violation was reported (the page counts both on `<body>`), and it shows "Healthy", the three node IDs, both files and chunk tiles;
+- through the browser's DevTools protocol on a loopback port, shows the page at exactly 1440 x 900, 390 x 844 and 390 x 2400 CSS pixels (as a phone below 600), checks that it does not scroll sideways at each width, and saves a screenshot of each (headless Chrome never makes its window narrower than about 500 px, so `--window-size` alone cannot show a phone layout);
+- measures the contrast of every visible run of text in each screenshot: the text's color from the page, its background from the screenshot's pixels around it (a frosted panel's background is whatever shows through it), against WCAG AA (4.5:1, or 3:1 for large text);
+- through the page itself, gives its file input `report.pdf` and `résumé 2026.pdf` (DevTools `DOM.setFileInputFiles`, so the page's own upload code runs), checks that the server stored each under its name and names it in `Content-Disposition`, clicks each file's download link on the page, and checks that Chrome saves it under exactly the same name with the same SHA-256, and that nothing else is left in the download folder: nobody has to rename a file;
+- kills node 1, waits until it is DOWN, and repeats the DOM and screenshot checks for the degraded cluster ("Degraded", node 1 DOWN, its copies unreachable).
+
+The screenshots go to a new `distributedfs-console-shots-<time>` folder in the temp folder (or `-OutDir`), and the script exits with code 0 only if every check passed. It is not part of CI: it depends on a browser outside the JDK, whose version on hosted runners changes without notice, and on headless timing. Once it has run reliably by hand for a while, it could become a CI step that does not fail the build.
+
+Checked by hand, not by a script (see the recorded runs):
+
+- `scripts\console-demo.ps1`: kill node 1 (`k`) and watch it turn DOWN; Dry run, then Repair, and see the new copies; restart it (`r`), then Repair again to trim the extra copies;
+- drag a file onto the page and choose one with the button; download a file and compare its SHA-256;
+- hide the tab and see in the browser's Network tab that polling stops, and starts again when the tab is shown;
+- use the page with the keyboard only, including opening and closing the repair report (Esc);
+- narrow the window to phone width.
+
+**Done by hand on 31 October 2026,** by the project's owner, in a real browser window with `scripts\console-demo.ps1`: every step above worked, including the Dry run and Repair buttons and their report, uploads by drag and drop and with the button, and a real PDF that downloaded under its own name and opened directly.
 
 ## Continuous integration
 
@@ -184,10 +223,29 @@ A run on 28 October 2026, on the same machine, tested milestone M4b-1 (the cross
 - **Deliberate-break checks:** 7 checks each broke one rule of the cross-site check in a separate copy of the source, and `CrossOriginTest` detected all 7: the check skipped for `/cluster/repair`; `Origin` compared as a prefix; `Origin: null` accepted; an origin accepted for either `127.0.0.1` or `localhost` whatever the request's Host; `Sec-Fetch-Site` ignored; the check applied to `POST /files` only; the storage node's check removed.
 - **`scripts\demo.ps1`**, **`scripts\kill-demo.ps1`** and **`scripts\repair-demo.ps1`:** all three printed `RESULT: SUCCESS` and exited with code 0, and none left a process or folder behind.
 
+A run on 29 October 2026, on the same machine, tested milestone M4b-2 (the web console and its three endpoints) before it was committed:
+
+- **Normal tests:** `scripts\test.ps1` in Windows PowerShell 5.1: all 42 suites exited with code 0. Of the 716 normal tests, 716 passed, 0 failed and 0 were skipped. The run took about 148 seconds. Three assertions of earlier suites were changed on purpose: `/` is no longer an unknown path (`DistributedFsServerTest`), and `GET /files` is no longer `405`, so the `Allow` header of `/files` is `GET, POST` (`UploadEndpointTest`, twice).
+- **Stress tests,** run separately with `scripts\test.ps1 -Stress`: all 10 passed with `-Xmx16m`, in about 17 seconds.
+- **Deliberate-break checks:** 18 checks (RB61 to RB78) each broke one rule in a separate copy of the source, and the tests detected all 18: the Content-Security-Policy header missing; `'unsafe-inline'` allowed; `nosniff` missing on the console's files; `frame-ancestors` missing; console files served by name from the resources folder; `HEAD` served; `innerHTML` used in the script; `GET /files` under the storage lock; the node listing reading chunk bytes; a DOWN node's copies reported reachable; a committed file with a leftover marker hidden; the event list unbounded; the listing not refreshed after a repair; not refreshed after an upload; trim candidates marked while a node is DOWN; a DOWN event recorded on every failed check; a query accepted on a console path; a placement's file ID decoded before it is checked. One needed a better test first: the listing not refreshed after an upload was detected by `FilesListEndpointTest` but not by `PlacementEndpointTest`, whose test made its first request for an unknown file, which lists nothing; that test now asks for a real file first, and detects it.
+- **`scripts\console-smoke.ps1`** with Chrome 156: all 43 checks passed, in about 37 seconds: the headers, the cross-site refusal, the page's scripts ran with no JavaScript error and no Content-Security-Policy violation, the healthy and the degraded cluster were shown as such, the page did not scroll sideways at 1440, 390 (844 and 2400 high) CSS pixels, and every measured run of text passed WCAG AA in all five screenshots (the lowest: the large, bold "Repair" label, 3.26:1 where 3:1 is needed). Earlier runs had found two problems: with node 1 DOWN, the chunk map's wider column headers made the page 414 px wide at 390, so the map's panel now clips its own scrolling; and once the color shapes showed through the panels, red text on the pink and peach tints measured 4.26 to 4.46:1, so red text now uses `#B42F2F` (the status red `#C93A3A` stays for dots, borders and tints).
+- **`scripts\console-demo.ps1`,** with the keys given through a pipe (`k`, an unknown key, `r`, `q`) and `-NoBrowser`: it killed node 1, restarted it on its port, stopped all 5 processes and deleted its folder, exit code 0.
+- **`scripts\demo.ps1`**, **`scripts\kill-demo.ps1`** and **`scripts\repair-demo.ps1`:** all three printed `RESULT: SUCCESS` and exited with code 0, and none left a process or folder behind.
+- **Not checked yet:** the hand checks listed in [Checking the web console](#checking-the-web-console) (drag and drop, a download from the page, polling stopping while the tab is hidden, keyboard use, and the Repair and Dry run buttons in a real browser window). The buttons, uploads and downloads go through the same endpoints the Java suites test, but the page's own handling of them has only been run in headless Chrome, without clicks.
+
+A later run on 29 October 2026, still before commit, tested original file names (`X-File-Name`, manifest format 3, `Content-Disposition`), added to M4b-2:
+
+- **Normal tests:** all 44 suites exited with code 0. Of the 741 normal tests, 741 passed, 0 failed and 0 were skipped, in about 150 seconds. Four assertions of earlier suites changed on purpose, because every answer that describes a file now has a `name` field (a string, or `null`): the exact `201` body in `UploadEndpointTest`, the `upload_finished` event in `ClusterEventsTest`, and the field lists in `FilesListEndpointTest` and `PlacementEndpointTest`. `UploadEndpointTest`'s storage-failure hook now overrides the `FileService.store` method that takes a name, which the handler calls.
+- **Stress tests:** all 10 passed with `-Xmx16m`, in about 16 seconds.
+- **Deliberate-break checks:** 15 checks (RB79 to RB93) each broke one rule in a separate copy of the source, and the tests detected all 15: the download's ASCII fallback keeping `"` (a second `filename` parameter); the name written into `filename*` unencoded; `/` accepted; 256 code points accepted; `.` and `..` accepted; malformed UTF-8 replaced instead of refused; format 2 manifests required to have a name; the name written into the manifest as raw UTF-8; `filename*` leaving spaces, quotes and parentheses unencoded; bidi overrides accepted; a file without a name downloaded without `<fileId>.bin`; the raw header stored instead of the decoded name; the console inserting a name as HTML; names normalized to NFC; the console not sending `X-File-Name`. One needed a better test first: the fallback keeping `"` was detected by `FileNamesTest` but not by `FileNamesEndpointTest`, which compared the header only with what `FileNames` builds; that test now also checks the header's structure on its own (two quotes, one `filename`, one `filename*`).
+- **`scripts\console-smoke.ps1`:** all 52 checks passed, in about 47 seconds, including the new ones: through the page's own file input and download links, `report.pdf` and `résumé 2026.pdf` were uploaded under their names and saved by Chrome under exactly the same names with the same SHA-256, and nothing else was left in the download folder.
+- **`scripts\demo.ps1`**, **`scripts\kill-demo.ps1`** and **`scripts\repair-demo.ps1`:** all three printed `RESULT: SUCCESS` and exited with code 0. **`scripts\console-demo.ps1`,** with the keys given through a pipe and `-NoBrowser`, killed and restarted node 1, stopped all 5 processes and deleted its folder, exit code 0 (it prints no `RESULT` line: it waits for keys).
+- **By hand, on 31 October 2026:** the owner clicked through every step of the [checklist](#checking-the-web-console) in a real browser, and all of them worked, including a real PDF that downloaded under its own name and opened directly. This closes the hand checks listed as not yet done in the run above.
+
 ## Running tests and contributing
 
 Personal learning project; issues and suggestions welcome.
 
 - Each `*Test` class is a small test runner with its own `main` method; no test framework is used. Every test that touches files runs in its own temporary folder, which is deleted afterwards, and a suite exits with code 1 if any test fails. HTTP tests start servers on free ports chosen at run time.
 - Several classes have package-private test hooks, such as `FileReconstructor.openChunk`, `StorageNode.openForReading`, `StorageNode.deleteChunkFile`, `ManifestStore.writeContent` and `ManifestStore.moveIntoPlace`, `FileApiHandler.respondHealth` and `FileApiHandler.prepareDownload`, and `DistributedFsDemo.createNode`. Tests in the same package override them to simulate disk failures, corrupted data and crashes.
-- Before suggesting a change, rebuild and run all 37 suites (647 normal tests) and, separately, the 10 stress tests, using the commands in [Run the tests](#run-the-tests).
+- Before suggesting a change, rebuild and run all 44 suites (741 normal tests) and, separately, the 10 stress tests, using the commands in [Run the tests](#run-the-tests).

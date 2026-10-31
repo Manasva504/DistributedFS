@@ -184,8 +184,9 @@ public class DistributedFsServerTest {
 
     private static void unknownPathsAre404(Path tempDir) throws Exception {
         withServer(tempDir, server -> {
-            // (/files/<fileId> is an endpoint: DownloadEndpointTest covers it.)
-            for (String path : List.of("/", "/health/", "/HEALTH", "/healthz", "/health/x",
+            // (/files/<fileId> is an endpoint: DownloadEndpointTest covers it. "/" is the web
+            // console's page since milestone M4b-2: ConsoleEndpointTest covers it.)
+            for (String path : List.of("/health/", "/HEALTH", "/healthz", "/health/x",
                     "/%68ealth", "/health%2F", "/./health", "/x/../health")) {
                 RawResponse response = raw(server.port(), get(path, validHost(server)));
                 checkErrorResponse(response, ApiError.NOT_FOUND, server, path);

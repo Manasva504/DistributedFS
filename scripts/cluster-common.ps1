@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-    Shared helpers of scripts\demo.ps1, scripts\kill-demo.ps1 and scripts\repair-demo.ps1; dot-source it, do not run it.
+    Shared helpers of scripts\demo.ps1, scripts\kill-demo.ps1, scripts\repair-demo.ps1, scripts\bench.ps1,
+    scripts\console-demo.ps1 and scripts\console-smoke.ps1; dot-source it, do not run it.
 
 .DESCRIPTION
     The caller sets $work (its own new temporary folder), $classes (a folder inside it) and
@@ -38,10 +39,13 @@ function Read-Shared([string]$path) {
 }
 
 # Finds the JDK, prints it, and compiles src\main\java into $classes, the same way as scripts\test.ps1
-# (an argument file instead of a wildcard). Sets $script:java.
+# (an argument file instead of a wildcard). Sets $script:java, and $script:resources: the web
+# console's files are read from the class path and javac copies nothing, so every Java process
+# started here gets src\main\resources on its class path next to the compiled classes.
 function Build-Classes([string]$root) {
     $javaHome = Find-JavaHome
     $script:java = Join-Path $javaHome 'bin\java.exe'
+    $script:resources = Join-Path $root 'src\main\resources'
     $javac = Join-Path $javaHome 'bin\javac.exe'
     Write-Host "== JDK: $javaHome"
     $sources = Get-ChildItem -Path (Join-Path $root 'src\main\java') -Recurse -Filter *.java |
@@ -58,7 +62,7 @@ function Start-JavaProcess([string]$name, [string[]]$javaArgs, [string]$ready) {
     $outLog = Join-Path $work "$name.out.log"
     $errLog = Join-Path $work "$name.err.log"
     # Start-Process joins its arguments with spaces, so each one is quoted.
-    $quoted = @('-cp', $classes) + $javaArgs | ForEach-Object { '"' + $_ + '"' }
+    $quoted = @('-cp', "$classes;$script:resources") + $javaArgs | ForEach-Object { '"' + $_ + '"' }
     $process = Start-Process -FilePath $script:java -ArgumentList $quoted -NoNewWindow -PassThru `
         -RedirectStandardOutput $outLog -RedirectStandardError $errLog
     $script:started += $process

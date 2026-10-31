@@ -24,6 +24,7 @@ public class ApiErrorTest {
             "400 invalid_checksum",
             "400 checksum_mismatch",
             "400 invalid_query",
+            "400 invalid_file_name",
             "403 host_not_allowed",
             "403 cross_origin_refused",
             "404 not_found",
@@ -36,7 +37,8 @@ public class ApiErrorTest {
             "500 integrity_check_failed",
             "500 metadata_corrupt",
             "500 storage_error",
-            "500 internal_error");
+            "500 internal_error",
+            "503 console_unavailable");
 
     private static int passed = 0;
     private static int failed = 0;

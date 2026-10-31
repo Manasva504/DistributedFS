@@ -15,6 +15,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -25,7 +26,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <p>Endpoints: {@code GET /health}, {@code POST /files} and {@code GET /files/<fileId>}, and,
  * when the server gives the handler a {@link ClusterApi}, {@code GET /cluster/status} (no query)
  * and {@code POST /cluster/repair} (no query, {@code ?dryRun=true} or {@code ?dryRun=false}; 409
- * {@code repair_in_progress} while a repair runs). Every other path is 404 {@code not_found}.
+ * {@code repair_in_progress} while a repair runs), and, with the web console ({@link ConsoleApi},
+ * {@link ConsoleAssets}), {@code GET /} and its two asset paths, {@code GET /files},
+ * {@code GET /files/<fileId>/placement} and {@code GET /cluster/events}. Every other path is 404
+ * {@code not_found}.
  *
  * <p><b>Host check.</b> The server listens on 127.0.0.1 only, but a web page in a browser on
  * this machine could still reach it through DNS rebinding. Such requests carry the attacker's host
@@ -48,7 +52,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <p><b>Uploads</b> ({@code POST /files}). The body is the file's raw bytes. Before any of it is
  * stored, the request must have exactly one {@code Content-Type: application/octet-stream} (415
  * otherwise), an optional {@code X-Content-SHA256} of exactly 64 hexadecimal characters (400
- * otherwise), and a {@code Content-Length}, if given, within the size limit (413 otherwise). Like
+ * otherwise), an optional {@code X-File-Name} with the original file name, percent-encoded UTF-8
+ * ({@link FileNames}; 400 {@code invalid_file_name} otherwise), and a {@code Content-Length}, if given, within the size limit (413 otherwise). Like
  * every other early answer, such a refusal is sent after at most 64 KiB of the body has been read
  * and discarded (see "Stalled clients" below). The body is otherwise copied into a new workspace,
  * stopping with 413 as soon as it passes the limit, and handed to {@link FileService#store}. If
@@ -101,6 +106,18 @@ class FileApiHandler implements HttpHandler {
     private static final String FILE_PATH_PREFIX = FILES_PATH + "/";
     static final String CLUSTER_STATUS_PATH = "/cluster/status";
     static final String CLUSTER_REPAIR_PATH = "/cluster/repair";
+    static final String CLUSTER_EVENTS_PATH = "/cluster/events";
+    static final String PLACEMENT_SUFFIX = "/placement";
+
+    /**
+     * The Content-Security-Policy of the console's files: nothing is allowed unless named; scripts,
+     * styles, images and requests only from this server; no inline script or style, no plugins,
+     * no forms, no base URL, no framing by any page (so the Repair button cannot be clickjacked),
+     * and Trusted Types, so that in browsers that support it any HTML-string sink throws.
+     */
+    static final String CONSOLE_CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self';"
+            + " img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
+            + " require-trusted-types-for 'script'";
     private static final String OCTET_STREAM = "application/octet-stream";
     private static final int BUFFER_SIZE = 64 * 1024;
 
@@ -121,6 +138,10 @@ class FileApiHandler implements HttpHandler {
     private final long stallTimeoutMillis;
     /** The cluster endpoints' answers; null for a handler without them (404, as for any unknown path). */
     private final ClusterApi clusterApi;
+    /** The web console's read-only endpoints; null for a handler without them (as before the console). */
+    private final ConsoleApi console;
+    /** The web console's files; never null (empty when they were not found). */
+    private final ConsoleAssets assets;
 
     FileApiHandler(int port, PrintStream err, FileService files) {
         this(port, err, files, STALL_TIMEOUT_MILLIS);
@@ -128,16 +149,31 @@ class FileApiHandler implements HttpHandler {
 
     /** With the cluster endpoints {@code GET /cluster/status} and {@code POST /cluster/repair}. */
     FileApiHandler(int port, PrintStream err, FileService files, ClusterApi clusterApi) {
-        this(port, err, files, STALL_TIMEOUT_MILLIS, Objects.requireNonNull(clusterApi, "clusterApi must not be null"));
+        this(port, err, files, STALL_TIMEOUT_MILLIS, Objects.requireNonNull(clusterApi, "clusterApi must not be null"),
+                null, ConsoleAssets.none());
+    }
+
+    /**
+     * With the cluster endpoints and the web console: {@code GET /}, its two asset paths,
+     * {@code GET /files}, {@code GET /files/<fileId>/placement} and {@code GET /cluster/events}.
+     */
+    FileApiHandler(int port, PrintStream err, FileService files, ClusterApi clusterApi, ConsoleApi console,
+                   ConsoleAssets assets) {
+        this(port, err, files, STALL_TIMEOUT_MILLIS, Objects.requireNonNull(clusterApi, "clusterApi must not be null"),
+                Objects.requireNonNull(console, "console must not be null"),
+                Objects.requireNonNull(assets, "assets must not be null"));
     }
 
     /** As above, with another stall timeout; tests use a short one. */
     FileApiHandler(int port, PrintStream err, FileService files, long stallTimeoutMillis) {
-        this(port, err, files, stallTimeoutMillis, null);
+        this(port, err, files, stallTimeoutMillis, null, null, ConsoleAssets.none());
     }
 
-    private FileApiHandler(int port, PrintStream err, FileService files, long stallTimeoutMillis, ClusterApi clusterApi) {
+    private FileApiHandler(int port, PrintStream err, FileService files, long stallTimeoutMillis, ClusterApi clusterApi,
+                           ConsoleApi console, ConsoleAssets assets) {
         this.clusterApi = clusterApi;
+        this.console = console;
+        this.assets = assets;
         if (port < 1 || port > 65535) {
             throw new IllegalArgumentException("port must be 1 to 65535, but was " + port);
         }
@@ -193,12 +229,47 @@ class FileApiHandler implements HttpHandler {
             respondHealth(exchange);
             return;
         }
+        if (console != null && ConsoleAssets.isRoute(path)) {
+            handleAsset(exchange, path, target);
+            return;
+        }
         if (FILES_PATH.equals(path)) {
+            if (console != null && "GET".equals(exchange.getRequestMethod())) {
+                if (target.getRawQuery() != null) {
+                    sendError(exchange, ApiError.INVALID_QUERY, null);
+                    return;
+                }
+                String json;
+                try {
+                    json = console.filesJson();
+                } catch (IOException | RuntimeException e) {
+                    err.println("Error: the file list could not be read: " + e);
+                    sendError(exchange, ApiError.STORAGE_ERROR, null);
+                    return;
+                }
+                sendJson(exchange, 200, json);
+                return;
+            }
             if (!"POST".equals(exchange.getRequestMethod())) {
-                sendError(exchange, ApiError.METHOD_NOT_ALLOWED, "POST");
+                sendError(exchange, ApiError.METHOD_NOT_ALLOWED, console != null ? "GET, POST" : "POST");
                 return;
             }
             handleUpload(exchange);
+            return;
+        }
+        if (console != null && path != null && path.startsWith(FILE_PATH_PREFIX) && path.endsWith(PLACEMENT_SUFFIX)) {
+            handlePlacement(exchange, path.substring(FILE_PATH_PREFIX.length(), path.length() - PLACEMENT_SUFFIX.length()),
+                    target);
+            return;
+        }
+        if (console != null && CLUSTER_EVENTS_PATH.equals(path)) {
+            if (!"GET".equals(exchange.getRequestMethod())) {
+                sendError(exchange, ApiError.METHOD_NOT_ALLOWED, "GET");
+            } else if (target.getRawQuery() != null) {
+                sendError(exchange, ApiError.INVALID_QUERY, null);
+            } else {
+                sendJson(exchange, 200, console.eventsJson());
+            }
             return;
         }
         if (path != null && path.startsWith(FILE_PATH_PREFIX)) {
@@ -311,6 +382,94 @@ class FileApiHandler implements HttpHandler {
     }
 
     // ---------------------------------------------------------------------
+    // The web console
+    // ---------------------------------------------------------------------
+
+    /** {@code GET /}, {@code /console/console.css} or {@code /console/console.js}: GET only, no query. */
+    private void handleAsset(HttpExchange exchange, String path, URI target) throws IOException {
+        if (!"GET".equals(exchange.getRequestMethod())) {
+            sendError(exchange, ApiError.METHOD_NOT_ALLOWED, "GET");
+            return;
+        }
+        if (target.getRawQuery() != null) {
+            sendError(exchange, ApiError.INVALID_QUERY, null);
+            return;
+        }
+        Optional<ConsoleAssets.Asset> asset = assets.get(path);
+        if (asset.isEmpty()) {
+            sendError(exchange, ApiError.CONSOLE_UNAVAILABLE, null);
+            return;
+        }
+        sendAsset(exchange, asset.get());
+    }
+
+    /** {@code GET /files/<fileId>/placement}: the raw ID is checked exactly, as for downloads. */
+    private void handlePlacement(HttpExchange exchange, String fileId, URI target) throws IOException {
+        if (!"GET".equals(exchange.getRequestMethod())) {
+            sendError(exchange, ApiError.METHOD_NOT_ALLOWED, "GET");
+            return;
+        }
+        if (!FileIds.isValid(fileId)) {
+            sendError(exchange, ApiError.INVALID_FILE_ID, null);
+            return;
+        }
+        if (target.getRawQuery() != null) {
+            sendError(exchange, ApiError.INVALID_QUERY, null);
+            return;
+        }
+        String json;
+        try {
+            json = console.placementJson(fileId);
+        } catch (FileServiceException e) {
+            if (e.reason() != FileServiceException.Reason.FILE_NOT_FOUND) {
+                err.println("Error: the placement of file " + fileId + " could not be read: " + e);
+            }
+            sendError(exchange, errorFor(e.reason()), null);
+            return;
+        }
+        sendJson(exchange, 200, json);
+    }
+
+    /**
+     * Sends one of the console's files with its security headers. The body is written in pieces
+     * of up to 64 KiB under the stall watchdog, like a download, so a client that never reads
+     * cannot hold the worker.
+     */
+    private void sendAsset(HttpExchange exchange, ConsoleAssets.Asset asset) throws IOException {
+        if (!finishRequestBody(exchange, "Request " + describeRequest(exchange))) {
+            return;
+        }
+        Headers headers = exchange.getResponseHeaders();
+        headers.set("Content-Type", asset.contentType());
+        headers.set("X-Content-Type-Options", "nosniff");
+        headers.set("Content-Security-Policy", CONSOLE_CSP);
+        headers.set("X-Frame-Options", "DENY");
+        headers.set("Referrer-Policy", "no-referrer");
+        headers.set("Cache-Control", "no-store");
+        byte[] bytes = asset.bytes();
+        try (StallWatch watch = new StallWatch(exchange, stallTimeoutMillis)) {
+            try {
+                exchange.sendResponseHeaders(200, bytes.length);
+                OutputStream out = exchange.getResponseBody();
+                for (int offset = 0; offset < bytes.length; offset += BUFFER_SIZE) {
+                    out.write(bytes, offset, Math.min(BUFFER_SIZE, bytes.length - offset));
+                    watch.progress();
+                }
+                out.flush();
+                watch.progress();
+                if (!watch.release()) {
+                    throw new IOException("the stall watchdog closed the connection");
+                }
+                out.close();
+            } catch (IOException e) {
+                err.println("Console file " + describeRequest(exchange) + " abandoned: "
+                        + (watch.fired() ? "the client accepted no data for " + stallTimeoutMillis + " ms"
+                                : "the client disconnected") + " (" + e + ")");
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
     // POST /files
     // ---------------------------------------------------------------------
 
@@ -328,6 +487,19 @@ class FileApiHandler implements HttpHandler {
                 return;
             }
             expectedSha256 = checksums.get(0);
+        }
+        String name = null;
+        List<String> names = headers.get(FileNames.HEADER);
+        if (names != null) {
+            try {
+                if (names.size() != 1) {
+                    throw new IllegalArgumentException("the header is repeated");
+                }
+                name = FileNames.decodeHeader(names.get(0));
+            } catch (IllegalArgumentException e) {
+                sendError(exchange, ApiError.INVALID_FILE_NAME, null);
+                return;
+            }
         }
         // The JDK has already refused malformed, negative or repeated Content-Length headers.
         String contentLength = headers.getFirst("Content-Length");
@@ -382,7 +554,7 @@ class FileApiHandler implements HttpHandler {
 
             FileManifest manifest;
             try {
-                manifest = files.store(body, workspace, expectedSha256);
+                manifest = files.store(body, workspace, expectedSha256, name);
             } catch (FileServiceException e) {
                 err.println("Error: upload failed: " + e + (e.getCause() != null ? " (cause: " + e.getCause() + ")" : ""));
                 for (Throwable suppressed : e.getSuppressed()) {
@@ -450,7 +622,8 @@ class FileApiHandler implements HttpHandler {
                 + ",\"size\":" + manifest.size()
                 + ",\"sha256\":" + Json.quote(manifest.sha256())
                 + ",\"chunkSize\":" + manifest.chunkSize()
-                + ",\"chunkCount\":" + manifest.chunkCount() + "}";
+                + ",\"chunkCount\":" + manifest.chunkCount()
+                + ",\"name\":" + (manifest.name() == null ? "null" : Json.quote(manifest.name())) + "}";
     }
 
     /** Exactly one Content-Type whose media type, before any ";", is application/octet-stream. */
@@ -606,6 +779,8 @@ class FileApiHandler implements HttpHandler {
         headers.set("Content-Type", OCTET_STREAM);
         headers.set("X-Content-Type-Options", "nosniff");
         headers.set("Accept-Ranges", "none");
+        // The original name, or <fileId>.bin; always one line of printable ASCII (see FileNames).
+        headers.set("Content-Disposition", FileNames.contentDisposition(download.manifest().name(), fileId));
         try (StallWatch watch = new StallWatch(exchange, stallTimeoutMillis)) {
             try {
                 // -1: no body (0 would mean "chunked"); otherwise exactly the verified size.
