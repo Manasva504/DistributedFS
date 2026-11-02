@@ -120,6 +120,179 @@ class FileService {
         this.maxUploadBytes = maxUploadBytes;
     }
 
+    // ---------------------------------------------------------------------
+    // Deleting a file
+    // ---------------------------------------------------------------------
+
+    /**
+     * What a delete did.
+     *
+     * @param name          the file's name, or null (no name, or an earlier delete being finished)
+     * @param chunksDeleted chunks of which this call deleted at least one copy
+     * @param finished      true if every copy of every chunk is confirmed gone and the deletion
+     *                      marker was removed; false if the marker was kept for later
+     */
+    record DeleteResult(String fileId, String name, int chunksDeleted, boolean finished) {
+    }
+
+    /** Told once per delete that passed its commit point. Must be quick and do no I/O. */
+    interface DeleteListener {
+        void deleted(DeleteResult result);
+    }
+
+    private volatile DeleteListener deleteListener;
+
+    /** Tells {@code listener} about every later delete (the server sets this before it listens). */
+    void setDeleteListener(DeleteListener listener) {
+        this.deleteListener = Objects.requireNonNull(listener, "listener must not be null");
+    }
+
+    /**
+     * Deletes the committed file {@code fileId}:
+     * <ol>
+     *   <li>Holding the storage lock: write the deletion marker ({@code <fileId>.deleting}, with the
+     *       chunk count), then remove the manifest. <b>Removing the manifest is the commit point</b>:
+     *       before it the file exists, after it downloads, listings and placements no longer see it.
+     *       A leftover pending marker of the file is removed too.</li>
+     *   <li>Delete every copy of every chunk, one chunk at a time, each holding the storage lock (as
+     *       the repair does), through StorageCluster.deleteChunk, which deletes only when every node
+     *       answers. A chunk no node holds counts as done.</li>
+     *   <li>If every chunk is confirmed gone, remove the marker. Otherwise (a node is down or cannot
+     *       answer) keep it: the next start's recovery or the next repair finishes the delete.</li>
+     * </ol>
+     * If the manifest is already gone but the marker is there (an earlier delete that did not
+     * finish), this call finishes it. A failure while removing the manifest is resolved by reading
+     * it back, as for an upload's commit: still there, the delete is undone (the marker removed);
+     * gone, it is committed; unknown, both are left for startup recovery.
+     *
+     * @throws FileServiceException FILE_NOT_FOUND (no manifest and no marker), METADATA_CORRUPT
+     *         (the manifest or the marker cannot be read), STORAGE_ERROR (nothing was deleted, or the
+     *         commit could not be confirmed)
+     */
+    DeleteResult delete(String fileId) throws FileServiceException {
+        if (!FileIds.isValid(fileId)) {
+            throw new IllegalArgumentException("fileId is not a valid file ID");
+        }
+        String name;
+        int chunkCount;
+        synchronized (storageLock) {
+            Optional<FileManifest> manifest;
+            Optional<ManifestStore.PendingUpload> marker;
+            try {
+                manifest = manifests.read(fileId);
+                marker = manifests.readDeletion(fileId);
+            } catch (IOException | RuntimeException e) {
+                throw new FileServiceException(FileServiceException.Reason.METADATA_CORRUPT,
+                        "the manifest or deletion marker of file " + fileId + " cannot be read", e);
+            }
+            if (manifest.isEmpty()) {
+                if (marker.isEmpty()) {
+                    throw new FileServiceException(FileServiceException.Reason.FILE_NOT_FOUND, "no file " + fileId, null);
+                }
+                name = null; // an earlier delete committed and did not finish: finish it
+                chunkCount = marker.get().chunkCount();
+            } else {
+                name = manifest.get().name();
+                chunkCount = manifest.get().chunkCount();
+                if (marker.isEmpty()) {
+                    try {
+                        manifests.createDeletion(new ManifestStore.PendingUpload(fileId, chunkCount));
+                    } catch (IOException | RuntimeException e) {
+                        throw storageError("could not record the delete of file " + fileId + " as started; nothing"
+                                + " was deleted", e);
+                    }
+                } else if (marker.get().chunkCount() != chunkCount) {
+                    throw new FileServiceException(FileServiceException.Reason.METADATA_CORRUPT, "the deletion marker"
+                            + " of file " + fileId + " has chunkCount " + marker.get().chunkCount() + ", its manifest "
+                            + chunkCount, null);
+                }
+                afterDeleteStep("marker");
+                commitDelete(fileId);
+                afterDeleteStep("manifest");
+                try {
+                    manifests.deletePending(fileId);
+                } catch (IOException | RuntimeException e) {
+                    err.println("Warning: the delete of file " + fileId + " could not remove its leftover pending-upload"
+                            + " marker; startup recovery removes it: " + e);
+                }
+            }
+        }
+        int chunksDeleted = 0;
+        boolean everyChunkConfirmed = true;
+        for (int i = 0; i < chunkCount; i++) {
+            String chunkId = FileIds.chunkId(fileId, i);
+            synchronized (storageLock) {
+                try {
+                    if (cluster.deleteChunk(chunkId)) {
+                        chunksDeleted++;
+                    }
+                } catch (IOException | RuntimeException e) {
+                    everyChunkConfirmed = false;
+                    err.println("Warning: the delete of file " + fileId + " could not delete chunk " + chunkId
+                            + " on every node; its deletion marker is kept, and the next start or repair finishes"
+                            + " the delete: " + e);
+                }
+            }
+            afterDeleteStep("chunk:" + i);
+        }
+        boolean finished = false;
+        if (everyChunkConfirmed) {
+            synchronized (storageLock) {
+                try {
+                    manifests.deleteDeletion(fileId);
+                    finished = true;
+                } catch (IOException | RuntimeException e) {
+                    err.println("Warning: every chunk of file " + fileId + " is deleted, but its deletion marker could"
+                            + " not be removed; the next start removes it: " + e);
+                }
+            }
+        }
+        DeleteResult result = new DeleteResult(fileId, name, chunksDeleted, finished);
+        DeleteListener listener = deleteListener;
+        if (listener != null) {
+            listener.deleted(result);
+        }
+        return result;
+    }
+
+    /** Removes the manifest: the delete's commit point. Must be called holding the storage lock. */
+    private void commitDelete(String fileId) throws FileServiceException {
+        try {
+            manifests.delete(fileId);
+            return;
+        } catch (IOException | RuntimeException e) {
+            boolean stillThere;
+            try {
+                stillThere = manifests.hasManifest(fileId);
+            } catch (IOException | RuntimeException again) {
+                e.addSuppressed(again);
+                err.println("Warning: removing the manifest of file " + fileId + " failed, and whether it is still there"
+                        + " cannot be checked; the manifest and the deletion marker were left for startup recovery");
+                throw storageError("the delete of file " + fileId + " could not be confirmed", e);
+            }
+            if (!stillThere) {
+                err.println("Warning: removing the manifest of file " + fileId + " reported a failure, but the manifest"
+                        + " is gone, so the delete is committed: " + e);
+                return;
+            }
+            try {
+                manifests.deleteDeletion(fileId);
+            } catch (IOException | RuntimeException undo) {
+                e.addSuppressed(undo);
+                err.println("Warning: the manifest of file " + fileId + " could not be removed and its deletion marker"
+                        + " could not be removed either; the next start removes the marker and keeps the file");
+            }
+            throw storageError("the manifest of file " + fileId + " could not be removed; nothing was deleted", e);
+        }
+    }
+
+    /**
+     * Called after each step of a delete: {@code marker}, {@code manifest}, then {@code chunk:<i>}
+     * for each chunk. A testability hook: CrashDeleteMain halts the process at a chosen step.
+     */
+    void afterDeleteStep(String step) {
+    }
+
     /** Tells {@code listener} about every later committed upload (the server sets this before it listens). */
     void setUploadListener(UploadListener listener) {
         this.uploadListener = Objects.requireNonNull(listener, "listener must not be null");

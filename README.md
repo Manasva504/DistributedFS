@@ -6,7 +6,7 @@ A small distributed file store in plain Java, with no dependencies: files are sp
 
 > **This is a learning project, not production software.** The server has no authentication, no TLS (plain HTTP on `127.0.0.1` only) and no storage quotas, and it has been tested only on Windows (one laptop and GitHub Actions' Windows runners). See [Known limitations](#limitations-and-future-work).
 
-**More detail:** [docs/DESIGN.md](docs/DESIGN.md) (architecture, every rule, options and limitations) · [docs/TESTING.md](docs/TESTING.md) (the 44 test suites, the browser check and every recorded result) · [docs/BENCHMARKS.md](docs/BENCHMARKS.md) (throughput, failure detection and repair timings)
+**More detail:** [docs/DESIGN.md](docs/DESIGN.md) (architecture, every rule, options and limitations) · [docs/TESTING.md](docs/TESTING.md) (the 48 test suites, the browser check and every recorded result) · [docs/BENCHMARKS.md](docs/BENCHMARKS.md) (throughput, failure detection and repair timings)
 
 ## Architecture
 
@@ -62,14 +62,14 @@ powershell -ExecutionPolicy Bypass -File scripts\demo.ps1          # upload a 5 
 powershell -ExecutionPolicy Bypass -File scripts\kill-demo.ps1     # kill a node: downloads and uploads go on
 powershell -ExecutionPolicy Bypass -File scripts\repair-demo.ps1   # kill a node, detect it, repair, restart it, trim
 powershell -ExecutionPolicy Bypass -File scripts\console-demo.ps1  # start a cluster and open the web console (k, r, q keys)
-powershell -ExecutionPolicy Bypass -File scripts\test.ps1          # build, then all 741 normal tests
+powershell -ExecutionPolicy Bypass -File scripts\test.ps1          # build, then all 781 normal tests
 ```
 
 (`-ExecutionPolicy Bypass` applies to that one command only; it is needed on machines whose policy blocks local scripts.) To run the server and nodes by hand, see [Running the server](docs/DESIGN.md#running-the-server) and [Running a storage node](docs/DESIGN.md#running-a-storage-node); the server's class path needs `src\main\resources` for the web console (`java -cp "out;src\main\resources" ...`).
 
 ### The web console
 
-`scripts\console-demo.ps1` opens it at `http://127.0.0.1:<port>/`: the cluster's health, each node, a chunk map of the selected file (one row per node, one column per chunk), the files with their health, an activity feed, drag-and-drop upload, and the Dry run and Repair buttons. In the console window, `k` kills node 1, `r` restarts it and `q` stops everything. These screenshots are from `scripts\console-smoke.ps1`, with node 1 killed:
+`scripts\console-demo.ps1` opens it at `http://127.0.0.1:<port>/`: the cluster's health, each node, a chunk map of the selected file (one row per node, one column per chunk), the files with their health and a delete button (with a confirmation), an activity feed, drag-and-drop upload, and the Dry run and Repair buttons. In the console window, `k` kills node 1, `r` restarts it and `q` stops everything. These screenshots are from `scripts\console-smoke.ps1`, with node 1 killed:
 
 ![The web console at 1440 x 900, with node 1 DOWN: the files report.pdf and résumé 2026.pdf are listed by name, and the chunk map shows node 1's copy as unreachable](docs/images/console-degraded-1440x900.png)
 
@@ -143,11 +143,12 @@ Excerpts from real runs on 27 October 2026 (`…` marks lines left out; IDs, por
 - **Streaming with bounded memory:** files pass through fixed-size buffers; the stress tests move 64 to 100 MiB through a 16 MiB Java heap.
 - **Storage nodes as separate processes**, reached over HTTP, each with its own folder, ID and lock; or, without `--node` options, local folders.
 - **Replication factor 2:** a file stays readable, and uploads keep working, while one node is down.
-- **Crash-safe uploads:** interrupted uploads are finished or undone when the server starts.
+- **Crash-safe uploads and deletes:** interrupted uploads and deletes are finished or undone when the server starts.
+- **Deletes:** `DELETE /files/<fileId>` removes the file at once and every copy of its chunks; copies on a node that is down are removed when it is back (by the next repair or start).
 - **Failure detection and repair:** heartbeats, `GET /cluster/status`, and `POST /cluster/repair` with a dry run.
 - **Degraded start:** the server starts with a recorded node down.
-- **Web console:** nodes, a chunk map, files with their health, an activity feed, upload, download and repair, polling the API; it works at phone width.
-- **Tested:** 741 normal tests and 10 stress tests in 44 plain-Java runners, run by GitHub Actions on Windows, with deliberate-break runs that confirm each safety rule has a test that fails without it ([docs/TESTING.md](docs/TESTING.md)).
+- **Web console:** nodes, a chunk map, files with their health, an activity feed, upload, download, delete and repair, polling the API; it works at phone width.
+- **Tested:** 781 normal tests and 10 stress tests in 48 plain-Java runners, run by GitHub Actions on Windows, with deliberate-break runs that confirm each safety rule has a test that fails without it ([docs/TESTING.md](docs/TESTING.md)).
 
 The full list, with the class behind each feature, is in [docs/DESIGN.md](docs/DESIGN.md#implemented-features).
 
@@ -168,6 +169,7 @@ The full list, with the class behind each feature, is in [docs/DESIGN.md](docs/D
 12. **The console is three plain files on the class path:** no framework, no npm and no build step, so the repository stays plain Java; the server loads them once and serves exactly three paths from memory, so no request path can reach another file.
 13. **The console reads cheaply:** one listing of each node, shared by every request for 1.5 seconds and refreshed after an upload or a repair, and never the storage lock, so polling never slows uploads, downloads or repairs.
 14. **A file keeps its own name:** the upload sends it (`X-File-Name`), the manifest stores it exactly (format 3, percent-encoded so manifests stay ASCII), and the download gives it back in `Content-Disposition`; the server refuses only what no real file can be called, so nobody has to rename a file, and every name leaves the server encoded, so none can inject a header.
+15. **Deletes commit when the manifest is removed:** a deletion marker is written first, then the manifest is removed (from then on the file is gone), then the copies; a crash before the commit keeps the file whole, one after it is finished by the next start, and copies a down node may hold are deleted only once every node answers, with the marker keeping them on record until then.
 
 The rules behind each are in [docs/DESIGN.md](docs/DESIGN.md): [Replication](docs/DESIGN.md#replication), [Failure detection and repair](docs/DESIGN.md#failure-detection-and-repair) and [Startup recovery](docs/DESIGN.md#startup-recovery).
 
@@ -203,7 +205,6 @@ Networked storage nodes, replication, and failure detection and repair are done 
 - Stop a client that stalls partway through its request headers from holding a worker thread (this step runs inside the JDK's HTTP server, before the handler).
 - Use the chunk checksums in startup recovery, and run the repair's checks in the background ("scrubbing"), so damaged copies are found before anyone downloads them or asks for a repair.
 - Let uploads and downloads skip nodes the heartbeat marks DOWN, and add or replace a node in `nodes.txt`.
-- A delete endpoint (files can be listed and located, but not deleted)
 - Run `scripts\console-smoke.ps1` in CI once it has proved stable by hand
 
 ## API
@@ -217,8 +218,9 @@ The server listens on `127.0.0.1` only and answers only requests whose `Host` is
 | `GET /files` | The committed files, newest first (at most 1,000), each with its health, and each node's copy count. No storage lock, no chunk read. | `200` with JSON |
 | `POST /files` | Uploads the body (`Content-Type: application/octet-stream`; optional `X-Content-SHA256`; optional `X-File-Name`, the original name, percent-encoded UTF-8). Stores 2 copies of every chunk, then commits the manifest. | `201` with `Location: /files/<fileId>` and the manifest as JSON; `400 checksum_mismatch`; `400 invalid_file_name`; `413 payload_too_large` (over 100 MiB by default); `415`; `500 storage_error` |
 | `GET /files/<fileId>` | Downloads a file, after checking every chunk and the whole file against the manifest. `Content-Disposition` gives its original name (RFC 8187 `filename*`), or `<fileId>.bin`. | `200` with the bytes; `400 invalid_file_id`; `404 file_not_found`; `500 chunk_missing`, `integrity_check_failed` or `metadata_corrupt` |
+| `DELETE /files/<fileId>` | Deletes a file: writes a deletion marker, removes the manifest (the commit point), then every copy of every chunk. | `200` when every copy is gone; `202` when copies wait for a node that is down; `400 invalid_file_id`; `404 file_not_found`; `500 storage_error` |
 | `GET /files/<fileId>/placement` | For each chunk, which nodes hold a copy, whether each is reachable, and which copies a repair would trim. | `200` with JSON; `400 invalid_file_id`; `404 file_not_found` |
-| `GET /cluster/events` | The last 100 events in memory: node DOWN and UP, upload finished, repair finished. | `200` with JSON |
+| `GET /cluster/events` | The last 100 events in memory: node DOWN and UP, upload finished, file deleted, delete finished, repair finished. | `200` with JSON |
 | `GET /cluster/status` | What the heartbeat last saw: each node's state, last good check and failures in a row. Reads no chunk and takes no lock. | `200` with JSON |
 | `POST /cluster/repair` | Restores 2 good copies of every chunk and trims extras; `?dryRun=true` only reports. Answers when finished. | `200` with a JSON report; `400 invalid_query`; `409 repair_in_progress` |
 
@@ -244,8 +246,9 @@ Every request, field and error code is described in [docs/DESIGN.md](docs/DESIGN
 | M3 | Failure detection and repair: heartbeat and `GET /cluster/status`, manual `POST /cluster/repair` (with dry run), more than 2 copies allowed, degraded start with a node down, `scripts\repair-demo.ps1` | `848e8e5`, merged in PR #8 (`8535e73`) |
 | M4a | This README rewritten for a short read, with the detail moved to `docs/DESIGN.md` and `docs/TESTING.md`; `scripts\bench.ps1` and `docs/BENCHMARKS.md` | `84feadb`, merged in PR #9 (`70bfb59`) |
 | M4b-1 | Cross-site requests refused on the server (`Origin`, `Sec-Fetch-Site`) and on the storage nodes | `f25b593`, merged in PR #10 (`3b6c1d0`) |
-| M4b-2 | Web console at `GET /`, with `GET /files`, `GET /files/<fileId>/placement` and `GET /cluster/events`; `scripts\console-demo.ps1` and `scripts\console-smoke.ps1` | PR #11 |
+| M4b-2 | Web console at `GET /`, with `GET /files`, `GET /files/<fileId>/placement` and `GET /cluster/events`; `scripts\console-demo.ps1` and `scripts\console-smoke.ps1` | `2cdfe0e`, merged in PR #11 (`cf9d828`) |
+| — | Deletes: `DELETE /files/<fileId>` with a deletion marker and the manifest's removal as the commit point, finished by startup recovery and the repair; the console's delete button | PR #12 |
 
 \* Phases 1–5 were built before the Git repository was created, so they are all in the initial commit.
 
-The repository layout is in [docs/DESIGN.md](docs/DESIGN.md#repository-structure). Personal learning project; issues and suggestions welcome. Before suggesting a change, run all 44 suites (741 normal tests) and, separately, the 10 stress tests, as described in [docs/TESTING.md](docs/TESTING.md#run-the-tests).
+The repository layout is in [docs/DESIGN.md](docs/DESIGN.md#repository-structure). Personal learning project; issues and suggestions welcome. Before suggesting a change, run all 48 suites (781 normal tests) and, separately, the 10 stress tests, as described in [docs/TESTING.md](docs/TESTING.md#run-the-tests).

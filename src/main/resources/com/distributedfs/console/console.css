@@ -143,6 +143,16 @@ button { font: inherit; color: inherit; }
   text-decoration: none;
 }
 
+/* Delete: white on the status red (#C93A3A) is about 5:1, so the label passes at any size. */
+.btn-danger {
+  background: var(--red);
+  border-color: rgba(255, 255, 255, 0.35);
+  color: #FFFFFF;
+  font-weight: 700;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.30), 0 8px 20px rgba(201, 58, 58, 0.25);
+}
+.icon-btn-danger { color: var(--red-ink); }
+
 /* ---- Top bar ---- */
 
 .topbar {
@@ -187,7 +197,8 @@ button { font: inherit; color: inherit; }
   align-items: start;
   padding: 28px 32px 40px;
 }
-.side { display: grid; gap: 28px; }
+.side { display: grid; gap: 28px; min-width: 0; }
+.files, .activity { min-width: 0; }
 
 .section-label {
   margin: 6px 6px 18px;
@@ -297,6 +308,7 @@ button { font: inherit; color: inherit; }
   border-radius: var(--radius-m);
   border: 1px solid transparent;
 }
+.file-row .icon-btn { width: 44px; height: 44px; border-radius: 14px; }
 .file-row.is-selected { background: rgba(255, 255, 255, 0.75); border-color: rgba(255, 255, 255, 0.95); box-shadow: 0 4px 14px rgba(28, 44, 32, 0.07); }
 .file-select {
   flex: 1; min-width: 0;
@@ -360,6 +372,8 @@ button { font: inherit; color: inherit; }
 .sheet-stats .stat dd { font-size: 28px; }
 .sheet-notes { display: grid; gap: 8px; color: var(--ink-soft); }
 .sheet-notes .is-bad { color: var(--red-ink); }
+.confirm-text { margin: 0 0 22px; color: var(--ink); overflow-wrap: anywhere; }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 12px; flex-wrap: wrap; }
 
 [hidden] { display: none !important; }
 
@@ -390,6 +404,7 @@ button { font: inherit; color: inherit; }
   .sheet { top: auto; right: 16px; bottom: 16px; max-height: calc(100vh - 32px); }
   .panel-title { font-size: 23px; }
   .tile { min-width: 76px; height: 54px; }
+  .file-row { gap: 6px; flex-wrap: wrap; }
   .map .col-status { white-space: normal; }
   .map tbody th { min-width: 92px; padding: 12px; }
 }

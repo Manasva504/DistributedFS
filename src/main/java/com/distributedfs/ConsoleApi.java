@@ -63,7 +63,15 @@ final class ConsoleApi {
         List<Listed> files = new ArrayList<>();
         int unreadable = 0;
         int pending = 0;
+        int deleting = 0;
         for (String name : names) {
+            if (name.endsWith(ManifestStore.DELETING_SUFFIX)) {
+                String id = name.substring(0, name.length() - ManifestStore.DELETING_SUFFIX.length());
+                if (FileIds.isValid(id) && !nameSet.contains(id + ManifestStore.MANIFEST_SUFFIX)) {
+                    deleting++; // deleted, but some copies wait for a node
+                }
+                continue;
+            }
             if (name.endsWith(ManifestStore.PENDING_SUFFIX)) {
                 String id = name.substring(0, name.length() - ManifestStore.PENDING_SUFFIX.length());
                 if (FileIds.isValid(id) && !nameSet.contains(id + ManifestStore.MANIFEST_SUFFIX)) {
@@ -101,7 +109,8 @@ final class ConsoleApi {
         StringBuilder json = new StringBuilder("{\"replicationFactor\":").append(replicas)
                 .append(",\"listedAt\":").append(Json.quote(snapshot.takenAt().toString()))
                 .append(",\"truncated\":").append(truncated)
-                .append(",\"skipped\":{\"pending\":").append(pending).append(",\"unreadable\":").append(unreadable).append('}')
+                .append(",\"skipped\":{\"pending\":").append(pending).append(",\"unreadable\":").append(unreadable)
+                .append(",\"deleting\":").append(deleting).append('}')
                 .append(",\"nodes\":");
         appendNodes(json, snapshot, true);
         json.append(",\"files\":[");

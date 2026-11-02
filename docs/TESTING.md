@@ -12,16 +12,20 @@ Each suite is a plain-Java program. It prints `PASS`, `FAIL` or `SKIP` for every
 | `ChecksumServiceTest` | 15 | 1 |
 | `ClusterEventsTest` | 12 | none |
 | `ClusterStatusEndpointTest` | 11 | none |
-| `ConsoleAssetsTest` | 13 | none |
+| `ConsoleAssetsTest` | 14 | none |
 | `ConsoleEndpointTest` | 15 | none |
 | `CrashRecoveryTest` | 8 | 1 |
-| `CrossOriginTest` | 18 | none |
+| `CrossOriginTest` | 19 | none |
 | `DataDirectoryTest` | 20 | none |
 | `DegradedStartupTest` | 15 | none |
+| `DeleteCrashTest` | 8 | none |
+| `DeleteEndpointTest` | 9 | none |
+| `DeleteRecoveryTest` | 8 | none |
 | `DistributedFsDemoTest` | 18 | 1 |
 | `DistributedFsServerTest` | 28 | none |
 | `DownloadEndpointTest` | 26 | 1 |
 | `FileChunkerTest` | 18 | none |
+| `FileDeleteTest` | 13 | none |
 | `FileIdsTest` | 12 | none |
 | `FileNamesEndpointTest` | 10 | none |
 | `FileNamesTest` | 14 | none |
@@ -52,7 +56,7 @@ Each suite is a plain-Java program. It prints `PASS`, `FAIL` or `SKIP` for every
 | `StorageNodeServerTest` | 6 | none |
 | `StorageNodeTest` | 58 | 1 |
 | `UploadEndpointTest` | 24 | 2 |
-| **Total** | **741** | **10** |
+| **Total** | **781** | **10** |
 
 The simplest way to build and run everything is the script that continuous integration uses. From the repository folder:
 
@@ -69,7 +73,7 @@ To run the suites by hand instead, from the repository folder:
 ```powershell
 foreach ($suite in 'ApiErrorTest', 'ChecksumServiceTest', 'ClusterEventsTest', 'ClusterStatusEndpointTest', 'ConsoleAssetsTest',
         'ConsoleEndpointTest', 'CrashRecoveryTest', 'CrossOriginTest',
-        'DataDirectoryTest', 'DegradedStartupTest', 'DistributedFsDemoTest', 'DistributedFsServerTest', 'DownloadEndpointTest', 'FileChunkerTest',
+        'DataDirectoryTest', 'DegradedStartupTest', 'DeleteCrashTest', 'DeleteEndpointTest', 'DeleteRecoveryTest', 'DistributedFsDemoTest', 'DistributedFsServerTest', 'DownloadEndpointTest', 'FileChunkerTest', 'FileDeleteTest',
         'FileIdsTest', 'FileNamesEndpointTest', 'FileNamesTest', 'FileReconstructorTest', 'FileServiceTest', 'FileTreesTest', 'FilesListEndpointTest', 'HeartbeatMonitorTest', 'JsonTest',
         'ManifestStoreTest', 'NetworkedRecoveryTest', 'NodeApiTest', 'NodeDataDirectoryTest', 'PlacementEndpointTest', 'RemoteClusterTest',
         'RemoteServerTest', 'RemoteStorageNodeTest', 'RepairEndpointTest', 'RepairServiceTest',
@@ -94,7 +98,7 @@ Some tests are reported as `SKIP` instead of passing when the machine can't run 
 - Five tests, two in `StorageNodeTest`, two in `StorageClusterTest` and one in `NodeApiTest`, need to create a symbolic link. Windows allows that only with Developer Mode turned on or with administrator rights. On the Windows 11 machine where the code was verified, the first four were skipped while Developer Mode was off, and all five ran and passed with it turned on (see [Recorded verification results](#recorded-verification-results)). Related checks are also tested with Windows junctions, which don't need special rights, and those tests ran; they don't replace the symbolic-link tests (see [Known limitations](DESIGN.md#known-limitations)).
 - One `DistributedFsServerTest` test needs an IPv4 address other than loopback, to show that the server can't be reached through it.
 
-`CrashRecoveryTest`, `DataDirectoryTest`, `NetworkedRecoveryTest` and `StorageNodeServerTest` start extra Java processes with the same class path, the node tests start node servers on free ports of `127.0.0.1`, and several tests create Windows junctions with `cmd.exe /c mklink /J` inside their own temporary folders.
+`CrashRecoveryTest`, `DataDirectoryTest`, `DeleteCrashTest`, `NetworkedRecoveryTest` and `StorageNodeServerTest` start extra Java processes with the same class path, the node tests start node servers on free ports of `127.0.0.1`, and several tests create Windows junctions with `cmd.exe /c mklink /J` inside their own temporary folders.
 
 Run the stress tests separately. The `-Xmx16m` option limits the Java heap to 16 MiB, so each test shows that the data streams through without being loaded into memory. Without that option the tests still run, and most print a warning if the heap is 64 MiB or larger:
 
@@ -129,6 +133,7 @@ It uses the Chrome or Edge already installed (standard paths; `-Browser <path>` 
 - through the browser's DevTools protocol on a loopback port, shows the page at exactly 1440 x 900, 390 x 844 and 390 x 2400 CSS pixels (as a phone below 600), checks that it does not scroll sideways at each width, and saves a screenshot of each (headless Chrome never makes its window narrower than about 500 px, so `--window-size` alone cannot show a phone layout);
 - measures the contrast of every visible run of text in each screenshot: the text's color from the page, its background from the screenshot's pixels around it (a frosted panel's background is whatever shows through it), against WCAG AA (4.5:1, or 3:1 for large text);
 - through the page itself, gives its file input `report.pdf` and `résumé 2026.pdf` (DevTools `DOM.setFileInputFiles`, so the page's own upload code runs), checks that the server stored each under its name and names it in `Content-Disposition`, clicks each file's download link on the page, and checks that Chrome saves it under exactly the same name with the same SHA-256, and that nothing else is left in the download folder: nobody has to rename a file;
+- through the page, clicks the delete button of `report.pdf`, checks that only the confirmation dialog opened and nothing was deleted yet, clicks its Delete button, and checks that the file is gone from `GET /files`, its download is `404`, and the page no longer lists it;
 - kills node 1, waits until it is DOWN, and repeats the DOM and screenshot checks for the degraded cluster ("Degraded", node 1 DOWN, its copies unreachable).
 
 The screenshots go to a new `distributedfs-console-shots-<time>` folder in the temp folder (or `-OutDir`), and the script exits with code 0 only if every check passed. It is not part of CI: it depends on a browser outside the JDK, whose version on hosted runners changes without notice, and on headless timing. Once it has run reliably by hand for a while, it could become a CI step that does not fail the build.
@@ -137,6 +142,7 @@ Checked by hand, not by a script (see the recorded runs):
 
 - `scripts\console-demo.ps1`: kill node 1 (`k`) and watch it turn DOWN; Dry run, then Repair, and see the new copies; restart it (`r`), then Repair again to trim the extra copies;
 - drag a file onto the page and choose one with the button; download a file and compare its SHA-256;
+- delete a file: Cancel (and Esc) keep it; Delete removes it from the list, and its download link no longer works; with node 1 killed, a delete says its last copies are removed later, the files panel says so, and a Repair after `r` finishes it (`delete_finished` in the activity feed);
 - hide the tab and see in the browser's Network tab that polling stops, and starts again when the tab is shown;
 - use the page with the keyboard only, including opening and closing the repair report (Esc);
 - narrow the window to phone width.
@@ -242,10 +248,19 @@ A later run on 29 October 2026, still before commit, tested original file names 
 - **`scripts\demo.ps1`**, **`scripts\kill-demo.ps1`** and **`scripts\repair-demo.ps1`:** all three printed `RESULT: SUCCESS` and exited with code 0. **`scripts\console-demo.ps1`,** with the keys given through a pipe and `-NoBrowser`, killed and restarted node 1, stopped all 5 processes and deleted its folder, exit code 0 (it prints no `RESULT` line: it waits for keys).
 - **By hand, on 31 October 2026:** the owner clicked through every step of the [checklist](#checking-the-web-console) in a real browser, and all of them worked, including a real PDF that downloaded under its own name and opened directly. This closes the hand checks listed as not yet done in the run above.
 
+A run on 2 November 2026, on the same machine, tested deletes (`DELETE /files/<fileId>`, deletion markers, their recovery and repair, and the console's delete button) before they were committed:
+
+- **Normal tests:** `scripts\test.ps1` in Windows PowerShell 5.1: all 48 suites exited with code 0. Of the 781 normal tests, 781 passed, 0 failed and 0 were skipped. Assertions of earlier suites changed on purpose: every path under `/files/` now answers other methods with `Allow: GET, DELETE` (`UploadEndpointTest`), and `GET /files` has a third `skipped` count, `deleting` (`FilesListEndpointTest`).
+- **Stress tests,** run separately with `scripts\test.ps1 -Stress`: all 10 passed with `-Xmx16m`, in about 17 seconds.
+- **Deliberate-break checks:** 16 checks (RB94 to RB109) each broke one rule in a separate copy of the source, and the tests detected all 16: the manifest removed before the marker is written; recovery finishing every delete, even one whose manifest is still there; recovery never finishing a committed delete; a chunk already gone treated as an error by recovery; the marker kept after recovery finished a delete; the marker removed even when a chunk's delete failed; a chunk's failed delete not noticed; recovery ignoring deletion markers; a deletion marker not keeping its file ID taken; the repair not checking under the lock that the file still exists; the repair removing the marker while a node is DOWN; the first step taken without the storage lock; `DELETE` exempt from the cross-site check; the file row's button deleting without the confirmation; the delete listener (events, listing refresh) not called; a leftover pending marker not removed with the manifest.
+- **`scripts\console-smoke.ps1`:** all 56 checks passed, in about 41 seconds, including the new delete through the page: the file row's button opened only the confirmation and deleted nothing; its Delete button removed the file from `GET /files`, its download answered `404`, and the page no longer listed it.
+- **`scripts\demo.ps1`**, **`scripts\kill-demo.ps1`** and **`scripts\repair-demo.ps1`:** all three printed `RESULT: SUCCESS` and exited with code 0. **`scripts\console-demo.ps1`,** with the keys given through a pipe and `-NoBrowser`, killed and restarted node 1, stopped all 5 processes and deleted its folder, exit code 0.
+- **By hand, on 2 November 2026:** the owner clicked through the delete checks of the [checklist](#checking-the-web-console) in a real browser window with `scripts\console-demo.ps1`, and all of them worked: Cancel kept the file, Delete removed it, a delete with node 1 DOWN said its last copies would be removed later, and a Repair after node 1 was back finished it.
+
 ## Running tests and contributing
 
 Personal learning project; issues and suggestions welcome.
 
 - Each `*Test` class is a small test runner with its own `main` method; no test framework is used. Every test that touches files runs in its own temporary folder, which is deleted afterwards, and a suite exits with code 1 if any test fails. HTTP tests start servers on free ports chosen at run time.
-- Several classes have package-private test hooks, such as `FileReconstructor.openChunk`, `StorageNode.openForReading`, `StorageNode.deleteChunkFile`, `ManifestStore.writeContent` and `ManifestStore.moveIntoPlace`, `FileApiHandler.respondHealth` and `FileApiHandler.prepareDownload`, and `DistributedFsDemo.createNode`. Tests in the same package override them to simulate disk failures, corrupted data and crashes.
-- Before suggesting a change, rebuild and run all 44 suites (741 normal tests) and, separately, the 10 stress tests, using the commands in [Run the tests](#run-the-tests).
+- Several classes have package-private test hooks, such as `FileReconstructor.openChunk`, `StorageNode.openForReading`, `StorageNode.deleteChunkFile`, `ManifestStore.writeContent` and `ManifestStore.moveIntoPlace`, `FileApiHandler.respondHealth` and `FileApiHandler.prepareDownload`, `FileService.afterDeleteStep`, `ManifestStore.deleteEntry`, `RepairService.beforeChunkHook`, and `DistributedFsDemo.createNode`. Tests in the same package override them to simulate disk failures, corrupted data and crashes.
+- Before suggesting a change, rebuild and run all 48 suites (781 normal tests) and, separately, the 10 stress tests, using the commands in [Run the tests](#run-the-tests).

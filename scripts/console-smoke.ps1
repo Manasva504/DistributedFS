@@ -22,7 +22,9 @@
       4. through the page itself (its file input, its upload, its download link), uploads report.pdf
          and a name with accents and a space, and checks that the server stored each under its
          name, that the download names it in Content-Disposition, and that Chrome saves it under
-         exactly the same name with the same SHA-256;
+         exactly the same name with the same SHA-256; then deletes report.pdf through the page: its
+         row's button must only open the confirmation, the dialog's Delete deletes it, and then it is
+         gone from GET /files and the page, and its download is 404;
       5. kills node 1, waits until GET /cluster/status shows it DOWN, and repeats step 3 for the
          degraded cluster ("Degraded", node 1 DOWN, unreachable copies), with screenshots;
       6. stops everything it started and deletes its work folder. The screenshots stay in -OutDir.
@@ -296,6 +298,60 @@ function Test-NamedUploads([string]$url, [int]$port) {
     Add-Check "the download folder holds exactly: $got" ($got -eq $expected)
 }
 
+# Deletes a file through the page: its row's delete button must only open the confirmation, and
+# only the dialog's Delete button deletes. Afterwards the file is gone from the list and the page,
+# and its download is 404.
+function Test-DeleteThroughPage([int]$port, [string]$name) {
+    $list = (New-Client).DownloadString("http://127.0.0.1:$port/files") | ConvertFrom-Json
+    $file = @($list.files | Where-Object { $_.name -eq $name })[0]
+    if (-not $file) {
+        Add-Check "`"$name`" is there to delete" $false
+        return
+    }
+    $open = '(function () { var name = ' + (ConvertTo-JsonText $name) + '; var rows = Array.prototype.filter.call(' +
+        'document.querySelectorAll(".file-row"), function (row) { var a = row.querySelector("a[download]");' +
+        ' return a && a.getAttribute("download") === name; }); if (rows.length !== 1) { return "rows:" + rows.length; }' +
+        ' rows[0].querySelector(".icon-btn-danger").click(); var dialog = document.getElementById("confirm");' +
+        ' return dialog.hidden ? "hidden" : document.getElementById("confirm-title").textContent; })()'
+    $answer = Invoke-DevTools 'Runtime.evaluate' ('{"expression":' + (ConvertTo-JsonText $open) + ',"returnByValue":true}')
+    $title = [regex]::Match($answer, '"value":"((?:[^"\\]|\\.)*)"').Groups[1].Value
+    Add-Check "the delete button opens a confirmation: $title" ($title -like "Delete *?")
+    Start-Sleep -Milliseconds 500
+    $still = @(((New-Client).DownloadString("http://127.0.0.1:$port/files") | ConvertFrom-Json).files |
+        Where-Object { $_.fileId -eq $file.fileId }).Count
+    Add-Check "nothing is deleted before the confirmation" ($still -eq 1)
+    [void](Invoke-DevTools 'Runtime.evaluate' '{"expression":"document.getElementById(\"confirm-delete\").click()"}')
+    $gone = $false
+    $deadline = (Get-Date).AddSeconds(20)
+    while (-not $gone -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 300
+        $gone = @(((New-Client).DownloadString("http://127.0.0.1:$port/files") | ConvertFrom-Json).files |
+            Where-Object { $_.fileId -eq $file.fileId }).Count -eq 0
+    }
+    $status = 0
+    try {
+        [void](Get-Headers "http://127.0.0.1:$port/files/$($file.fileId)")
+        $status = 200
+    } catch [System.Net.WebException] {
+        if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode; $_.Exception.Response.Close() }
+    } catch {
+        if ($_.Exception.InnerException -and $_.Exception.InnerException.Response) {
+            $status = [int]$_.Exception.InnerException.Response.StatusCode
+        }
+    }
+    Add-Check "after Delete, `"$name`" is gone from GET /files and its download is 404 (got $status)" ($gone -and $status -eq 404)
+    $check = '(function () { var name = ' + (ConvertTo-JsonText $name) + '; return Array.prototype.some.call(' +
+        'document.querySelectorAll("a[download]"), function (a) { return a.getAttribute("download") === name; }); })()'
+    $listed = $true
+    $deadline = (Get-Date).AddSeconds(10)
+    while ($listed -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 300
+        $listed = (Invoke-DevTools 'Runtime.evaluate' ('{"expression":' + (ConvertTo-JsonText $check) +
+            ',"returnByValue":true}')).Contains('"value":true')
+    }
+    Add-Check "the page no longer lists `"$name`"" (-not $listed)
+}
+
 # WCAG relative luminance of an sRGB color.
 function Get-Luminance([double]$r, [double]$g, [double]$b) {
     $channels = foreach ($c in @($r, $g, $b)) {
@@ -464,6 +520,9 @@ try {
 
     Write-Host "== Named uploads and downloads through the page"
     Test-NamedUploads $url $port
+
+    Write-Host "== Deleting a file through the page"
+    Test-DeleteThroughPage $port 'report.pdf'
 
     Write-Host "== Degraded cluster: killing node 1 (pid $($nodes[1].Process.Id))"
     Stop-StartedProcess $nodes[1].Process

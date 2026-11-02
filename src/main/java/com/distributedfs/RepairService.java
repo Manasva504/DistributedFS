@@ -69,6 +69,8 @@ final class RepairService {
     private final AtomicBoolean running = new AtomicBoolean();
     /** Told about every finished repair and dry run (the web console); null for none. */
     private volatile Consumer<RepairReport> listener;
+    /** Run before each chunk, outside the lock: a testability hook (a test deletes a file mid-repair). */
+    volatile Runnable beforeChunkHook;
 
     RepairService(StorageCluster cluster, ManifestStore manifests, FileService files, Path tmpDir,
                   HeartbeatMonitor monitor, PrintStream err) {
@@ -136,7 +138,8 @@ final class RepairService {
         final List<String> lost = new ArrayList<>();
         final ChecksumService checksums = new ChecksumService();
         int filesChecked, filesSkipped, chunksChecked, chunksHealthy, copiesAdded, copiesReplaced, copiesRemoved;
-        int chunksLost, chunksUncertain, chunksNotRepaired;
+        int chunksLost, chunksUncertain, chunksNotRepaired, deletesFinished, deletesWaiting;
+        final List<String> finishedDeletes = new ArrayList<>();
         boolean trimSkipped;
         Path workspace;
 
@@ -152,18 +155,21 @@ final class RepairService {
             listCopies();
             Set<String> manifestIds = new TreeSet<>();
             Set<String> pendingIds = new HashSet<>();
+            Set<String> deletingIds = new TreeSet<>();
             for (String name : manifests.listEntryNames()) {
                 if (name.endsWith(ManifestStore.MANIFEST_SUFFIX)) {
                     manifestIds.add(name.substring(0, name.length() - ManifestStore.MANIFEST_SUFFIX.length()));
                 } else if (name.endsWith(ManifestStore.PENDING_SUFFIX)) {
                     pendingIds.add(name.substring(0, name.length() - ManifestStore.PENDING_SUFFIX.length()));
+                } else if (name.endsWith(ManifestStore.DELETING_SUFFIX)) {
+                    deletingIds.add(name.substring(0, name.length() - ManifestStore.DELETING_SUFFIX.length()));
                 }
             }
             workspace = Files.createTempDirectory(tmpDir, "repair-");
             try {
                 for (String fileId : manifestIds) {
-                    if (!FileIds.isValid(fileId) || pendingIds.contains(fileId)) {
-                        filesSkipped++; // recovery is responsible for pending uploads
+                    if (!FileIds.isValid(fileId) || pendingIds.contains(fileId) || deletingIds.contains(fileId)) {
+                        filesSkipped++; // recovery is responsible for pending uploads; a delete has started
                         continue;
                     }
                     Optional<FileManifest> manifest;
@@ -183,12 +189,25 @@ final class RepairService {
                     for (int i = 0; i < m.chunkCount(); i++) {
                         String chunkId = m.chunkId(i);
                         String expected = m.chunkSha256s().get(i);
-                        files.withStorageLock(() -> {
+                        Runnable hook = beforeChunkHook;
+                        if (hook != null) {
+                            hook.run();
+                        }
+                        // Checked again under the lock: the file may have been deleted since the
+                        // manifests were listed. Its chunks are then gone on purpose, never "lost".
+                        boolean stillThere = files.withStorageLock(() -> {
+                            if (!manifests.hasManifest(fileId)) {
+                                return false;
+                            }
                             repairChunk(chunkId, expected);
-                            return null;
+                            return true;
                         });
+                        if (!stillThere) {
+                            break;
+                        }
                     }
                 }
+                finishDeletes(deletingIds);
             } finally {
                 files.deleteWorkspace(workspace);
             }
@@ -199,7 +218,64 @@ final class RepairService {
             return new RepairReport(dryRun, cluster.replicas(), states, filesChecked, filesSkipped, chunksChecked,
                     chunksHealthy, copiesAdded, copiesReplaced, copiesRemoved, chunksLost, chunksUncertain,
                     chunksNotRepaired, trimSkipped, List.copyOf(failed), List.copyOf(lost),
-                    (System.nanoTime() - started) / 1_000_000);
+                    (System.nanoTime() - started) / 1_000_000, deletesFinished, deletesWaiting, List.copyOf(finishedDeletes));
+        }
+
+        /**
+         * Finishes deletes that passed their commit point (a deletion marker without a manifest):
+         * every copy of every chunk, then the marker, each step holding the storage lock. Only
+         * while every node is UP and none failed in this run, since a node that is not UP may still
+         * hold copies; otherwise they wait. A dry run only counts them.
+         */
+        void finishDeletes(Set<String> deletingIds) throws IOException {
+            for (String fileId : deletingIds) {
+                if (!FileIds.isValid(fileId) || manifests.hasManifest(fileId)) {
+                    continue; // not committed: the delete was undone or is still running; startup recovery decides
+                }
+                if (!everyNodeUp || !failed.isEmpty()) {
+                    deletesWaiting++;
+                    continue;
+                }
+                if (dryRun) {
+                    deletesFinished++;
+                    continue;
+                }
+                Optional<ManifestStore.PendingUpload> marker;
+                try {
+                    marker = manifests.readDeletion(fileId);
+                } catch (IOException | RuntimeException e) {
+                    err.println("Warning: repair could not finish the delete of file " + fileId + ": its deletion marker"
+                            + " cannot be read: " + e);
+                    deletesWaiting++;
+                    continue;
+                }
+                if (marker.isEmpty()) {
+                    continue; // finished meanwhile by the delete itself
+                }
+                boolean done = true;
+                for (int i = 0; i < marker.get().chunkCount() && done; i++) {
+                    String chunkId = marker.get().chunkId(i);
+                    try {
+                        files.withStorageLock(() -> cluster.deleteChunk(chunkId));
+                    } catch (IOException | RuntimeException e) {
+                        err.println("Warning: repair could not finish the delete of file " + fileId + ": chunk " + chunkId
+                                + " could not be deleted on every node: " + e);
+                        done = false;
+                    }
+                }
+                if (done) {
+                    try {
+                        files.withStorageLock(() -> manifests.deleteDeletion(fileId));
+                        deletesFinished++;
+                        finishedDeletes.add(fileId);
+                        continue;
+                    } catch (IOException | RuntimeException e) {
+                        err.println("Warning: repair deleted every chunk of file " + fileId + " but could not remove its"
+                                + " deletion marker: " + e);
+                    }
+                }
+                deletesWaiting++;
+            }
         }
 
         /** One listing per UP node: which canonical chunks it holds as regular files, and how many. */

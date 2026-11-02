@@ -25,6 +25,7 @@ import java.util.regex.Pattern;
  * <pre>
  *   &lt;fileId&gt;.manifest   one per stored file (see {@link FileManifest})
  *   &lt;fileId&gt;.pending    an upload in progress (see {@link PendingUpload})
+ *   &lt;fileId&gt;.deleting   a delete in progress (the same format as a pending marker)
  * </pre>
  *
  * <p><b>Written once, never replaced.</b> Each file is written to a new temp file named
@@ -52,9 +53,11 @@ class ManifestStore {
 
     static final String MANIFEST_SUFFIX = ".manifest";
     static final String PENDING_SUFFIX = ".pending";
+    static final String DELETING_SUFFIX = ".deleting";
 
     private static final Pattern MANIFEST_NAME = Pattern.compile("[0-9a-f]{32}\\.manifest");
     private static final Pattern PENDING_NAME = Pattern.compile("([0-9a-f]{32})\\.pending");
+    private static final Pattern DELETING_NAME = Pattern.compile("([0-9a-f]{32})\\.deleting");
 
     /**
      * Exactly the names {@code Files.createTempFile(folder, fileId + "-", ".tmp")} produces: the
@@ -181,13 +184,68 @@ class ManifestStore {
     }
 
     /**
-     * Reports whether {@code fileId} is already used by a manifest or a pending-upload marker.
-     * Any entry under either name counts, even a damaged one, so a new upload never reuses it.
+     * Reports whether {@code fileId} is already used by a manifest, a pending-upload marker or a
+     * deletion marker (a deleted file's chunks may still be on a node until its delete finishes).
+     * Any entry under any of these names counts, even a damaged one, so a new upload never reuses it.
      *
      * @throws IOException if the folder is unavailable
      */
     boolean isIdTaken(String fileId) throws IOException {
-        return entryExists(entryFor(fileId, MANIFEST_SUFFIX)) || entryExists(entryFor(fileId, PENDING_SUFFIX));
+        return entryExists(entryFor(fileId, MANIFEST_SUFFIX)) || entryExists(entryFor(fileId, PENDING_SUFFIX))
+                || entryExists(entryFor(fileId, DELETING_SUFFIX));
+    }
+
+    /** True if anything is named like {@code fileId}'s manifest; nothing is read or parsed. */
+    boolean hasManifest(String fileId) throws IOException {
+        return entryExists(entryFor(fileId, MANIFEST_SUFFIX));
+    }
+
+    // ---------------------------------------------------------------------
+    // Deletion markers
+    // ---------------------------------------------------------------------
+
+    /**
+     * Writes a deletion marker: the record that a delete has started, written before the file's
+     * manifest is removed (the delete's commit point), with the chunk count needed to find the
+     * chunks once the manifest is gone. Same format and never-replace rules as a pending marker.
+     */
+    void createDeletion(PendingUpload marker) throws IOException {
+        Objects.requireNonNull(marker, "marker must not be null");
+        writeNewFile(marker.fileId(), entryFor(marker.fileId(), DELETING_SUFFIX), marker.toText());
+    }
+
+    /** Reads a deletion marker, with the same rules as {@link #readPending}. */
+    Optional<PendingUpload> readDeletion(String fileId) throws IOException {
+        Path file = entryFor(fileId, DELETING_SUFFIX);
+        Optional<String> text = readSmallTextFile(file, PendingUpload.MAX_TEXT_BYTES);
+        if (text.isEmpty()) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(PendingUpload.parse(text.get(), fileId));
+        } catch (InvalidManifestException e) {
+            throw new InvalidManifestException("Deletion marker " + file + " is invalid: " + e.getMessage(), e);
+        }
+    }
+
+    /** Deletes a deletion marker, with the same rules as {@link #delete}. */
+    boolean deleteDeletion(String fileId) throws IOException {
+        return deleteRegularFile(entryFor(fileId, DELETING_SUFFIX));
+    }
+
+    /** The file IDs of all deletion markers, sorted; only names {@code <fileId>.deleting} count. */
+    List<String> listDeletionFileIds() throws IOException {
+        List<String> fileIds = new ArrayList<>();
+        try (DirectoryStream<Path> entries = Files.newDirectoryStream(manifestsDir)) {
+            for (Path entry : entries) {
+                Matcher matcher = DELETING_NAME.matcher(entry.getFileName().toString());
+                if (matcher.matches()) {
+                    fileIds.add(matcher.group(1));
+                }
+            }
+        }
+        Collections.sort(fileIds);
+        return fileIds;
     }
 
     // ---------------------------------------------------------------------
@@ -209,7 +267,8 @@ class ManifestStore {
      */
     int sweepStaleTempFiles(Consumer<String> warnings) throws IOException {
         return StaleTempFiles.sweep(manifestsDir, "the manifest folder", TEMP_NAME,
-                name -> MANIFEST_NAME.matcher(name).matches() || PENDING_NAME.matcher(name).matches(), warnings);
+                name -> MANIFEST_NAME.matcher(name).matches() || PENDING_NAME.matcher(name).matches()
+                        || DELETING_NAME.matcher(name).matches(), warnings);
     }
 
     /**
@@ -340,8 +399,13 @@ class ManifestStore {
         if (!attributes.isRegularFile()) {
             throw new IOException(entry + " is not a regular file; it was left in place");
         }
-        Files.delete(entry);
+        deleteEntry(entry);
         return true;
+    }
+
+    /** Deletes one checked entry. A testability hook, like {@link #moveIntoPlace}: tests make it fail. */
+    void deleteEntry(Path entry) throws IOException {
+        Files.delete(entry);
     }
 
     /** A missing name means "absent" only while the folder itself is still there. */

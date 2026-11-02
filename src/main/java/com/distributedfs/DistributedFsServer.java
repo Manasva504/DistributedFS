@@ -206,12 +206,15 @@ public final class DistributedFsServer {
     private final HeartbeatMonitor monitor;
     private final PlacementSnapshot placement;
     private final ClusterEvents events;
+    private final RepairService repair;
     private boolean stopped = false;
 
     private DistributedFsServer(Config config, DataDirectory dataDirectory, StorageCluster cluster,
                                 ManifestStore manifests, FileService files, HttpServer httpServer,
                                 ThreadPoolExecutor executor, List<RemoteStorageNode> remoteNodes,
-                                HeartbeatMonitor monitor, PlacementSnapshot placement, ClusterEvents events) {
+                                HeartbeatMonitor monitor, PlacementSnapshot placement, ClusterEvents events,
+                                RepairService repair) {
+        this.repair = repair;
         this.remoteNodes = List.copyOf(remoteNodes);
         this.monitor = monitor;
         this.placement = placement;
@@ -443,8 +446,15 @@ public final class DistributedFsServer {
                 events.uploadFinished(manifest, copies);
                 placement.invalidate();
             });
+            files.setDeleteListener(result -> {
+                events.fileDeleted(result);
+                placement.invalidate();
+            });
             repair.setListener(report -> {
                 events.repairFinished(report);
+                for (String fileId : report.finishedDeletes()) {
+                    events.deleteFinished(fileId);
+                }
                 if (!report.dryRun()) {
                     placement.invalidate();
                 }
@@ -463,7 +473,7 @@ public final class DistributedFsServer {
             httpServer.start();
 
             DistributedFsServer server = new DistributedFsServer(config, dataDirectory, cluster, manifests,
-                    files, httpServer, executor, remoteNodes, monitor, placement, events);
+                    files, httpServer, executor, remoteNodes, monitor, placement, events, repair);
             if (dataDirectory.newlyInitialized()) {
                 config.out().println("Initialized a new data directory: " + dataDirectory.root());
             }
@@ -626,6 +636,11 @@ public final class DistributedFsServer {
     /** The web console's shared view of the copies, for tests of its sharing and refresh. */
     PlacementSnapshot placement() {
         return placement;
+    }
+
+    /** The repair, for tests that act in the middle of one. */
+    RepairService repair() {
+        return repair;
     }
 
     /** The web console's activity feed, for tests. */

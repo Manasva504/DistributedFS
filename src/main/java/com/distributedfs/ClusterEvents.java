@@ -11,7 +11,8 @@ import java.util.Objects;
 /**
  * The last {@link #CAPACITY} things that happened to the cluster, in memory only, for the web
  * console's activity feed ({@code GET /cluster/events}): a node going DOWN or coming back UP, an
- * upload committing, and a repair or dry run finishing.
+ * upload committing, a file deleted (and a delete that waited finished later), and a repair or
+ * dry run finishing.
  *
  * <p>Every event gets the next sequence number (from 1) and the time it was recorded. The oldest
  * event is dropped when a new one would make more than {@link #CAPACITY}. Nothing is written to
@@ -52,6 +53,18 @@ final class ClusterEvents {
         add("upload_finished", ",\"fileId\":" + Json.quote(manifest.fileId())
                 + ",\"name\":" + (manifest.name() == null ? "null" : Json.quote(manifest.name())) + ",\"size\":" + manifest.size()
                 + ",\"chunks\":" + manifest.chunkCount() + ",\"copies\":" + copies);
+    }
+
+    /** A delete passed its commit point; {@code finished} is false if copies wait for a node. */
+    void fileDeleted(FileService.DeleteResult result) {
+        add("file_deleted", ",\"fileId\":" + Json.quote(result.fileId())
+                + ",\"name\":" + (result.name() == null ? "null" : Json.quote(result.name()))
+                + ",\"chunksDeleted\":" + result.chunksDeleted() + ",\"finished\":" + result.finished());
+    }
+
+    /** A delete that waited for a node was finished by a repair. */
+    void deleteFinished(String fileId) {
+        add("delete_finished", ",\"fileId\":" + Json.quote(fileId));
     }
 
     void repairFinished(RepairReport report) {
