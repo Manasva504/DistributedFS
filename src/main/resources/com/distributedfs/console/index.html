@@ -105,5 +105,15 @@
   <dl class="sheet-stats" id="sheet-stats"></dl>
   <ul class="sheet-notes" id="sheet-notes"></ul>
 </div>
+<div class="sheet glass" id="confirm" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title"
+     aria-describedby="confirm-text" hidden>
+  <p class="sheet-kicker">Delete file</p>
+  <h2 class="sheet-title" id="confirm-title">Delete this file?</h2>
+  <p class="confirm-text" id="confirm-text"></p>
+  <div class="confirm-actions">
+    <button type="button" class="btn" id="confirm-cancel">Cancel</button>
+    <button type="button" class="btn btn-danger" id="confirm-delete">Delete</button>
+  </div>
+</div>
 </body>
 </html>

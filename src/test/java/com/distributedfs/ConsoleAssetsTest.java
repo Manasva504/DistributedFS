@@ -55,6 +55,8 @@ public class ConsoleAssetsTest {
         RUNNER.run("polling stops while the tab is hidden, and runs every 1 and 2 seconds", ConsoleAssetsTest::polling);
         RUNNER.run("uploads send the file's own name, and names are shown as text, isolated, and used for downloads",
                 ConsoleAssetsTest::fileNames);
+        RUNNER.run("a delete is sent only from the confirmation dialog, never from the file row's button",
+                ConsoleAssetsTest::deleteAsksFirst);
         RUNNER.finish();
     }
 
@@ -218,6 +220,21 @@ public class ConsoleAssetsTest {
         checkContains(text("console.css"), "unicode-bidi: isolate;");
         // ... and is the downloaded file's name.
         checkContains(js, "download: named ? file.name : file.fileId + '.bin'");
+    }
+
+    private static void deleteAsksFirst(Path tempDir) throws IOException {
+        String js = code(text("console.js"));
+        // One DELETE request in the whole script, inside deleteFile ...
+        checkEquals(1, matches(js, "request\\('DELETE'").size(), "DELETE requests");
+        checkContains(js, "function deleteFile(file) {");
+        // ... which only the confirmation dialog's Delete button calls ...
+        checkEquals(2, matches(js, "deleteFile\\(").size(), "deleteFile: its definition and one call");
+        checkContains(js, "byId('confirm-delete').addEventListener('click', function () {");
+        // ... while the file row's button only opens the dialog.
+        checkContains(js, "remove.addEventListener('click', function () { askDelete(file); });");
+        String html = text("index.html");
+        checkContains(html, "id=\"confirm\" role=\"alertdialog\" aria-modal=\"true\"");
+        checkContains(html, "<button type=\"button\" class=\"btn\" id=\"confirm-cancel\">Cancel</button>");
     }
 
     // ---------------------------------------------------------------------

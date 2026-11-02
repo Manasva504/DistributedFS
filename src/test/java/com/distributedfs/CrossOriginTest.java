@@ -55,6 +55,8 @@ public class CrossOriginTest {
                 CrossOriginTest::repairForeignOrigin);
         RUNNER.run("dry runs and repairs with dryRun=false are refused the same way", CrossOriginTest::repairQueries);
         RUNNER.run("a repair with Sec-Fetch-Site cross-site is refused", CrossOriginTest::repairFetchSite);
+        RUNNER.run("a DELETE from another site is refused and deletes nothing; from the own origin it deletes",
+                CrossOriginTest::deleteChecked);
         RUNNER.run("GET requests are answered whatever their Origin: they change nothing", CrossOriginTest::getsIgnoreOrigin);
         RUNNER.run("the Host check comes first: a wrong Host with a foreign Origin is host_not_allowed",
                 CrossOriginTest::hostCheckFirst);
@@ -281,6 +283,33 @@ public class CrossOriginTest {
             check(!Files.exists(copy), "a refused repair put the copy back");
             checkEquals(200, repairWith(port, null, "Sec-Fetch-Site: same-origin").status(), "same-origin");
             checkEquals(2, holderFolders(tempDir, FileIds.chunkId(id, 0)).size(), "copies after the accepted repair");
+        } finally {
+            server.stop();
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // DELETE /files/<id>
+    // ---------------------------------------------------------------------
+
+    private static void deleteChecked(Path tempDir) throws Exception {
+        DistributedFsServer server = localServer(tempDir);
+        try {
+            int port = server.port();
+            byte[] data = randomBytes(CHUNK, 21);
+            String id = fileId(upload(port, data));
+            String target = "DELETE /files/" + id + " HTTP/1.1\r\n" + host(port) + "\r\n";
+            for (String header : List.of("Origin: http://evil.example", "Origin: null", "Origin: http://localhost:" + port,
+                    "Sec-Fetch-Site: cross-site", "Sec-Fetch-Site: same-site")) {
+                checkRefused(raw(port, target + header, null), header);
+            }
+            check(Arrays.equals(data, download(port, id).body()), "the file after the refused deletes");
+            checkEquals(List.of(), listNames(server.dataRoot().resolve("manifests")).stream()
+                    .filter(n -> n.endsWith(ManifestStore.DELETING_SUFFIX)).toList(), "deletion markers");
+            NodeTestKit.RawResponse own = raw(port, target + "Origin: http://127.0.0.1:" + port + "\r\nSec-Fetch-Site: same-origin",
+                    null);
+            checkEquals(200, own.status(), "own-origin delete");
+            checkEquals(404, download(port, id).status(), "download after the delete");
         } finally {
             server.stop();
         }

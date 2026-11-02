@@ -70,7 +70,7 @@ public class FilesListEndpointTest {
                     new ArrayList<>(json.keySet()), "fields");
             checkEquals(2L, json.get("replicationFactor"), "replicationFactor");
             checkEquals(false, json.get("truncated"), "truncated");
-            checkEquals(Map.of("pending", 0L, "unreadable", 0L), json.get("skipped"), "skipped");
+            checkEquals(Map.of("pending", 0L, "unreadable", 0L, "deleting", 0L), json.get("skipped"), "skipped");
             checkEquals(List.of(), json.get("files"), "files");
             List<Map<String, Object>> nodes = TestJson.objects(json, "nodes");
             checkEquals(3, nodes.size(), "nodes");
@@ -148,7 +148,7 @@ public class FilesListEndpointTest {
             List<Map<String, Object>> list = TestJson.objects(json, "files");
             checkEquals(1, list.size(), "files");
             checkEquals(committed, list.get(0).get("fileId"), "listed");
-            checkEquals(Map.of("pending", 1L, "unreadable", 0L), json.get("skipped"), "skipped");
+            checkEquals(Map.of("pending", 1L, "unreadable", 0L, "deleting", 0L), json.get("skipped"), "skipped");
         } finally {
             server.stop();
         }
@@ -163,7 +163,7 @@ public class FilesListEndpointTest {
             NodeTestKit.RawResponse response = raw(server.port(), "GET /files HTTP/1.1\r\n" + host(server.port()), null);
             checkEquals(200, response.status(), "status");
             Map<String, Object> json = TestJson.object(response.text());
-            checkEquals(Map.of("pending", 0L, "unreadable", 1L), json.get("skipped"), "skipped");
+            checkEquals(Map.of("pending", 0L, "unreadable", 1L, "deleting", 0L), json.get("skipped"), "skipped");
             checkEquals(good, TestJson.objects(json, "files").get(0).get("fileId"), "the readable file");
             check(!response.text().contains("manifests") && !response.text().contains("\\\\"), "a path in the answer");
         } finally {

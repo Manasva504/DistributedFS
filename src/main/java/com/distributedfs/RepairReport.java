@@ -26,11 +26,27 @@ import java.util.stream.Collectors;
  * @param nodesFailedDuringRepair nodes that failed during this run and were not used again in it
  * @param lost                   the IDs of the lost chunks (at most {@link #MAX_LISTED})
  * @param durationMillis         how long the run took
+ * @param deletesFinished        deletes that had passed their commit point and were finished now
+ *                               (every copy deleted, the deletion marker removed); for a dry run,
+ *                               those that would be
+ * @param deletesWaiting         unfinished deletes left for later, because a node was not UP
+ * @param finishedDeletes        the file IDs of the deletes finished now (not in the JSON)
  */
 record RepairReport(boolean dryRun, int replicationFactor, List<NodeState> nodes, int filesChecked, int filesSkipped,
                     int chunksChecked, int chunksHealthy, int copiesAdded, int copiesReplaced, int copiesRemoved,
                     int chunksLost, int chunksUncertain, int chunksNotRepaired, boolean trimSkipped,
-                    List<Integer> nodesFailedDuringRepair, List<String> lost, long durationMillis) {
+                    List<Integer> nodesFailedDuringRepair, List<String> lost, long durationMillis,
+                    int deletesFinished, int deletesWaiting, List<String> finishedDeletes) {
+
+    /** A report without deletes to finish. */
+    RepairReport(boolean dryRun, int replicationFactor, List<NodeState> nodes, int filesChecked, int filesSkipped,
+                 int chunksChecked, int chunksHealthy, int copiesAdded, int copiesReplaced, int copiesRemoved,
+                 int chunksLost, int chunksUncertain, int chunksNotRepaired, boolean trimSkipped,
+                 List<Integer> nodesFailedDuringRepair, List<String> lost, long durationMillis) {
+        this(dryRun, replicationFactor, nodes, filesChecked, filesSkipped, chunksChecked, chunksHealthy, copiesAdded,
+                copiesReplaced, copiesRemoved, chunksLost, chunksUncertain, chunksNotRepaired, trimSkipped,
+                nodesFailedDuringRepair, lost, durationMillis, 0, 0, List.of());
+    }
 
     /** At most this many lost chunk IDs are listed. */
     static final int MAX_LISTED = 100;
@@ -62,6 +78,8 @@ record RepairReport(boolean dryRun, int replicationFactor, List<NodeState> nodes
                 + ",\"trimSkipped\":" + trimSkipped
                 + ",\"nodesFailedDuringRepair\":[" + failed + "]"
                 + ",\"lost\":[" + lostList + "]"
+                + ",\"deletesFinished\":" + deletesFinished
+                + ",\"deletesWaiting\":" + deletesWaiting
                 + ",\"durationMillis\":" + durationMillis + "}";
     }
 }

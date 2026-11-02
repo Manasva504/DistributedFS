@@ -570,10 +570,17 @@
         svgIcon(['M12 4v11', 'M7 10l5 5 5-5', 'M5 20h14']),
         el('span', { cls: 'visually-hidden', text: 'Download ' + fileLabel(file.fileId, file.name) })
       ]);
+      var remove = el('button', { cls: 'icon-btn icon-btn-danger', attrs: { type: 'button' } }, [
+        svgIcon(['M4 7h16', 'M10 11v6', 'M14 11v6', 'M6 7l1 13h10l1-13', 'M9 7V4h6v3']),
+        el('span', { cls: 'visually-hidden', text: 'Delete ' + fileLabel(file.fileId, file.name) })
+      ]);
+      // Never deletes at once: it only asks, in the confirmation dialog.
+      remove.addEventListener('click', function () { askDelete(file); });
       return el('li', { cls: 'file-row' + (selected ? ' is-selected' : '') }, [
         select,
         el('span', { cls: 'badge ' + b.cls, text: b.text }),
-        download
+        download,
+        remove
       ]);
     });
     replaceChildren(byId('file-list'), rows);
@@ -587,6 +594,10 @@
     }
     if (data.skipped.unreadable > 0) {
       notes.push(plural(data.skipped.unreadable, 'manifest', 'manifests') + ' could not be read.');
+    }
+    if (data.skipped.deleting > 0) {
+      notes.push(plural(data.skipped.deleting, 'deleted file still has', 'deleted files still have')
+        + ' copies on a node that did not answer; they are removed when it does.');
     }
     var note = byId('files-note');
     note.textContent = notes.join(' ');
@@ -731,6 +742,11 @@
       case 'repair_finished':
         return { text: repairSummary(e) + ' · ' + plural(e.chunksChecked, 'chunk', 'chunks') + ' checked',
           cls: e.chunksLost > 0 ? 'is-bad' : 'is-ok' };
+      case 'file_deleted':
+        return { text: 'Deleted ' + fileLabel(e.fileId, e.name) + (e.finished ? ' · every copy removed'
+          : ' · some copies wait for a node'), cls: e.finished ? 'is-ok' : 'is-bad' };
+      case 'delete_finished':
+        return { text: 'Delete of ' + shortId(e.fileId) + ' finished · every copy removed', cls: 'is-ok' };
       default:
         return { text: String(e.type), cls: '' };
     }
@@ -773,37 +789,84 @@
   // ------------------------------------------------------------------
 
   var lastFocus = null;
+  var openDialogId = null;
+  var pendingDelete = null;   // the file the confirmation dialog asks about
+
+  // ------------------------------------------------------------------
+  // Deleting a file: always after a confirmation
+  // ------------------------------------------------------------------
+
+  function askDelete(file) {
+    var label = fileLabel(file.fileId, file.name);
+    byId('confirm-title').textContent = 'Delete ' + label + '?';
+    byId('confirm-text').textContent = label + ' (' + formatBytes(file.size) + ', ID ' + file.fileId + '). Every copy on'
+      + ' every node is removed. This cannot be undone.';
+    openDialog('confirm', 'confirm-cancel');
+    pendingDelete = file;
+  }
+
+  function deleteFile(file) {
+    var label = fileLabel(file.fileId, file.name);
+    uploadStatus('Deleting ' + label + '…', false);
+    request('DELETE', '/files/' + encodeURIComponent(file.fileId)).then(function (result) {
+      uploadStatus(result && result.finished === false
+        ? 'Deleted ' + label + '; its last copies are removed when every node answers again.'
+        : 'Deleted ' + label + '.', false);
+    }, function (error) {
+      uploadStatus(error instanceof HttpError
+        ? (error.status === 404 ? label + ' was already deleted.'
+          : 'The delete failed (HTTP ' + error.status + (error.code ? ', ' + error.code : '') + ').')
+        : 'The server could not be reached.', true);
+    }).then(function () {
+      if (state.selected === file.fileId) {
+        state.selected = null;
+        state.placement = null;
+      }
+      statusPoller.now();
+      dataPoller.now();
+    });
+  }
+
+  // Shows one dialog ('sheet' for the repair report, 'confirm' for a delete) over the backdrop,
+  // and moves the focus into it; closing it gives the focus back.
+  function openDialog(id, focusId) {
+    closeDialog();
+    lastFocus = document.activeElement;
+    openDialogId = id;
+    byId('sheet-backdrop').hidden = false;
+    byId(id).hidden = false;
+    byId(focusId).focus();
+  }
+
+  function closeDialog() {
+    if (openDialogId === null) {
+      return;
+    }
+    byId(openDialogId).hidden = true;
+    byId('sheet-backdrop').hidden = true;
+    openDialogId = null;
+    pendingDelete = null;
+    if (lastFocus && typeof lastFocus.focus === 'function') {
+      lastFocus.focus();
+    }
+  }
 
   function openSheet(kicker, title, stats, notes) {
     byId('sheet-kicker').textContent = kicker;
     byId('sheet-title').textContent = title;
     replaceChildren(byId('sheet-stats'), stats.map(function (s) { return stat(s[0], s[1]); }));
     replaceChildren(byId('sheet-notes'), notes.map(function (n) { return el('li', { cls: n[1] || '', text: n[0] }); }));
-    lastFocus = document.activeElement;
-    byId('sheet-backdrop').hidden = false;
-    byId('sheet').hidden = false;
-    byId('sheet-close').focus();
-  }
-
-  function closeSheet() {
-    if (byId('sheet').hidden) {
-      return;
-    }
-    byId('sheet').hidden = true;
-    byId('sheet-backdrop').hidden = true;
-    if (lastFocus && typeof lastFocus.focus === 'function') {
-      lastFocus.focus();
-    }
+    openDialog('sheet', 'sheet-close');
   }
 
   function trapFocus(event) {
-    var sheet = byId('sheet');
-    if (sheet.hidden) {
+    if (openDialogId === null) {
       return;
     }
+    var sheet = byId(openDialogId);
     if (event.key === 'Escape') {
       event.preventDefault();
-      closeSheet();
+      closeDialog();
       return;
     }
     if (event.key !== 'Tab') {
@@ -912,8 +975,16 @@
     byId('server-address').textContent = window.location.host;
     byId('dry-run').addEventListener('click', function () { runRepair(true); });
     byId('repair').addEventListener('click', function () { runRepair(false); });
-    byId('sheet-close').addEventListener('click', closeSheet);
-    byId('sheet-backdrop').addEventListener('click', closeSheet);
+    byId('sheet-close').addEventListener('click', closeDialog);
+    byId('confirm-cancel').addEventListener('click', closeDialog);
+    byId('confirm-delete').addEventListener('click', function () {
+      var file = pendingDelete;
+      closeDialog();
+      if (file) {
+        deleteFile(file);
+      }
+    });
+    byId('sheet-backdrop').addEventListener('click', closeDialog);
     document.addEventListener('keydown', trapFocus);
     setUpUpload();
     statusPoller.now();

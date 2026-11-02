@@ -55,13 +55,22 @@ import java.util.regex.Pattern;
  *       file or absent, nothing unexpected), the cleanup is deferred: the marker
  *       is kept so the next start retries, a warning is logged, and recovery continues. Anything
  *       else stops recovery at once, and the exception says which uploads were already resolved.</li>
+ *   <li><b>Interrupted deletes</b> (deletion markers, {@code <fileId>.deleting}). Each marker is read
+ *       strictly in step 2, with the pending markers: a damaged one stops the start, with nothing
+ *       changed. A delete's commit point is the removal of its manifest. With the manifest still
+ *       there, the delete never committed: only the marker is removed, and the file is kept. Without
+ *       it, the delete committed and is finished: every copy of every chunk is deleted
+ *       (StorageCluster.deleteChunk; a chunk already gone counts as done), then the marker. In a
+ *       degraded start a committed delete waits, since a missing node may hold copies. A failure
+ *       keeps the marker, with a warning, for the next start (and the repair); it never stops the
+ *       start, since nothing but copies to remove or a marker is left.</li>
  *   <li><b>Sweep stale temp files</b> in the manifest folder, each node folder and the tmp folder
  *       (see {@link StaleTempFiles}). Junctions, links and other reparse points are never deleted or
  *       entered. Failures are warnings only: temp files hold no recovery information.</li>
  *   <li><b>Scan for unreferenced chunks</b> (report only) with a fresh listing. Only names of the
  *       exact form {@code <32 lowercase hex>_<index without leading zeros>} are considered, and
- *       chunks of uploads still pending are skipped. {@code ORPHAN_CHUNK}: the file ID has neither a
- *       manifest nor a pending marker. {@code UNREFERENCED_EXTRA_CHUNK}: the file has a readable
+ *       chunks of uploads still pending, and of deletes still waiting, are skipped. {@code ORPHAN_CHUNK}:
+ *       the file ID has no manifest, no pending marker and no deletion marker. {@code UNREFERENCED_EXTRA_CHUNK}: the file has a readable
  *       manifest and the index is at least its chunk count. A manifest that cannot be read is
  *       reported as {@code UNCHECKED_FILE}, and its chunks are not classified. The scan never
  *       deletes or changes anything and never stops the start. With replication (R &ge; 2) it
@@ -97,6 +106,8 @@ final class StartupRecovery {
             Pattern.compile("([0-9a-f]{32})" + Pattern.quote(ManifestStore.MANIFEST_SUFFIX));
     private static final Pattern PENDING_ENTRY =
             Pattern.compile("([0-9a-f]{32})" + Pattern.quote(ManifestStore.PENDING_SUFFIX));
+    private static final Pattern DELETING_ENTRY =
+            Pattern.compile("([0-9a-f]{32})" + Pattern.quote(ManifestStore.DELETING_SUFFIX));
 
     /**
      * FileService.newUploadWorkspace and newDownloadWorkspace: {@code Files.createTempDirectory(tmp,
@@ -139,7 +150,26 @@ final class StartupRecovery {
      *                         their markers were kept, and the next start tries again
      */
     record Result(List<String> committed, List<String> rolledBack, int chunksDeleted, List<String> deferred,
-                  int tempItemsRemoved, List<Finding> findings, List<String> uncheckedFiles, List<String> waiting) {
+                  int tempItemsRemoved, List<Finding> findings, List<String> uncheckedFiles, List<String> waiting,
+                  Deletes deletes) {
+    }
+
+    /**
+     * What recovery did with interrupted deletes (deletion markers).
+     *
+     * @param undone        deletes that had not reached their commit point (the manifest was still
+     *                      there): only the marker was removed, and the file is kept
+     * @param finished      deletes past their commit point: every copy of every chunk was deleted,
+     *                      then the marker
+     * @param chunksDeleted chunks of which a copy was deleted while finishing them
+     * @param deferred      deletes whose cleanup failed; their markers were kept for the next start
+     * @param waiting       committed deletes that wait for a node that did not answer; their markers were kept
+     */
+    record Deletes(List<String> undone, List<String> finished, int chunksDeleted, List<String> deferred,
+                   List<String> waiting) {
+        boolean any() {
+            return !undone.isEmpty() || !finished.isEmpty() || !deferred.isEmpty() || !waiting.isEmpty();
+        }
     }
 
     private final List<ChunkStore> nodes;
@@ -211,9 +241,26 @@ final class StartupRecovery {
                 }
             }
         }
+        List<DeletePlan> deletePlans = new ArrayList<>();
+        List<String> deletesWaiting = new ArrayList<>();
+        for (String fileId : before.deletingIds()) {
+            try {
+                DeletePlan plan = assessDelete(fileId, before);
+                if (plan.finish() && !missing.isEmpty()) {
+                    deletesWaiting.add(fileId); // a missing node may hold copies: finished at a later start
+                } else {
+                    deletePlans.add(plan);
+                }
+            } catch (Unsafe e) {
+                unsafe.put(fileId, e.getMessage());
+                if (firstCause == null) {
+                    firstCause = e.getCause();
+                }
+            }
+        }
         if (!unsafe.isEmpty()) {
             StringBuilder message = new StringBuilder("Startup recovery found ").append(unsafe.size())
-                    .append(" interrupted upload(s) it cannot recover safely, so the server will not start."
+                    .append(" interrupted upload(s) or delete(s) it cannot recover safely, so the server will not start."
                             + " Nothing was changed.");
             unsafe.forEach((fileId, reason) -> message.append("\n  ").append(fileId).append(": ").append(reason));
             message.append("\nInspect these entries; recovery never deletes what it cannot explain.");
@@ -244,6 +291,9 @@ final class StartupRecovery {
             }
         }
 
+        // Step 3b: act on interrupted deletes.
+        Deletes deletes = actOnDeletes(deletePlans, deletesWaiting);
+
         // Step 4: sweep stale temp files.
         int tempItemsRemoved = sweepStaleTempFiles();
 
@@ -259,6 +309,13 @@ final class StartupRecovery {
                     + rolledBack.size() + " rolled back (" + chunksDeleted + " chunk(s) deleted), " + deferred.size()
                     + " deferred; " + tempItemsRemoved + " stale temp file(s) or workspace(s) removed");
         }
+        if (deletes.any()) {
+            out.println("Recovery: " + (deletes.undone().size() + deletes.finished().size() + deletes.deferred().size()
+                    + deletes.waiting().size()) + " interrupted delete(s): " + deletes.undone().size() + " undone (the"
+                    + " file is kept), " + deletes.finished().size() + " finished (" + deletes.chunksDeleted()
+                    + " chunk(s) deleted), " + deletes.deferred().size() + " deferred, " + deletes.waiting().size()
+                    + " waiting for a node that did not answer");
+        }
         if (!waiting.isEmpty()) {
             out.println("Recovery: " + waiting.size() + " interrupted upload(s) wait for " + onNodes(List.copyOf(
                     new TreeSet<>(missing))) + ", which did not answer; their markers were kept, and the next start"
@@ -266,7 +323,8 @@ final class StartupRecovery {
             waiting.forEach((fileId, reason) -> out.println("  " + fileId + ": " + reason));
         }
         return new Result(List.copyOf(committed), List.copyOf(rolledBack), chunksDeleted, List.copyOf(deferred),
-                tempItemsRemoved, List.copyOf(findings), List.copyOf(uncheckedFiles), List.copyOf(waiting.keySet()));
+                tempItemsRemoved, List.copyOf(findings), List.copyOf(uncheckedFiles), List.copyOf(waiting.keySet()),
+                deletes);
     }
 
     // ---------------------------------------------------------------------
@@ -274,20 +332,24 @@ final class StartupRecovery {
     // ---------------------------------------------------------------------
 
     /** One listing of the manifest folder and of every node folder. */
-    private record Snapshot(Set<String> manifestIds, List<String> pendingIds, List<List<String>> nodeNames,
-                            List<Set<String>> nodeNameSets) {
+    private record Snapshot(Set<String> manifestIds, List<String> pendingIds, List<String> deletingIds,
+                            List<List<String>> nodeNames, List<Set<String>> nodeNameSets) {
     }
 
     private Snapshot snapshot() throws IOException {
         Set<String> manifestIds = new HashSet<>();
         List<String> pendingIds = new ArrayList<>();
+        List<String> deletingIds = new ArrayList<>();
         for (String name : manifests.listEntryNames()) {
             Matcher manifest = MANIFEST_ENTRY.matcher(name);
             Matcher pending = PENDING_ENTRY.matcher(name);
+            Matcher deleting = DELETING_ENTRY.matcher(name);
             if (manifest.matches()) {
                 manifestIds.add(manifest.group(1));
             } else if (pending.matches()) {
                 pendingIds.add(pending.group(1));
+            } else if (deleting.matches()) {
+                deletingIds.add(deleting.group(1));
             }
         }
         List<List<String>> nodeNames = new ArrayList<>();
@@ -302,7 +364,7 @@ final class StartupRecovery {
             nodeNames.add(names);
             nodeNameSets.add(new HashSet<>(names));
         }
-        return new Snapshot(manifestIds, pendingIds, nodeNames, nodeNameSets);
+        return new Snapshot(manifestIds, pendingIds, deletingIds, nodeNames, nodeNameSets);
     }
 
     // ---------------------------------------------------------------------
@@ -606,6 +668,72 @@ final class StartupRecovery {
     }
 
     // ---------------------------------------------------------------------
+    // Step 3b: interrupted deletes
+    // ---------------------------------------------------------------------
+
+    /** One deletion marker: undo it (the manifest is still there) or finish the delete (it is not). */
+    private record DeletePlan(String fileId, boolean finish, int chunkCount) {
+    }
+
+    /**
+     * Reads a deletion marker strictly (a damaged one is unsafe: its chunk count is never guessed)
+     * and decides by the delete's commit point, the manifest's removal: with the manifest still
+     * there the delete never committed and is undone; without it the delete committed and is finished.
+     */
+    private DeletePlan assessDelete(String fileId, Snapshot snapshot) throws Unsafe {
+        ManifestStore.PendingUpload marker;
+        try {
+            Optional<ManifestStore.PendingUpload> read = manifests.readDeletion(fileId);
+            if (read.isEmpty()) {
+                throw new Unsafe("its deletion marker disappeared while recovery was reading it", null);
+            }
+            marker = read.get();
+        } catch (IOException | RuntimeException e) {
+            throw new Unsafe("its deletion marker is corrupt or unreadable, and its chunk count is never guessed ("
+                    + e + ")", e);
+        }
+        return new DeletePlan(fileId, !snapshot.manifestIds().contains(fileId), marker.chunkCount());
+    }
+
+    /**
+     * Undoes or finishes each delete. A committed delete deletes every copy of every chunk (a chunk
+     * already gone counts as done), then the marker. A failure is never unsafe: what is left is
+     * only copies to remove or a marker, so the marker is kept and the next start tries again (and,
+     * for a committed delete, so does the next repair).
+     */
+    private Deletes actOnDeletes(List<DeletePlan> plans, List<String> waiting) {
+        List<String> undone = new ArrayList<>();
+        List<String> finished = new ArrayList<>();
+        List<String> deferred = new ArrayList<>();
+        int chunksDeleted = 0;
+        for (DeletePlan plan : plans) {
+            String step = "removing the deletion marker";
+            try {
+                if (plan.finish()) {
+                    for (int i = 0; i < plan.chunkCount(); i++) {
+                        String chunkId = FileIds.chunkId(plan.fileId(), i);
+                        step = "deleting chunk " + chunkId;
+                        if (cluster.deleteChunk(chunkId)) {
+                            chunksDeleted++;
+                        }
+                    }
+                    step = "removing the deletion marker";
+                }
+                manifests.deleteDeletion(plan.fileId());
+                (plan.finish() ? finished : undone).add(plan.fileId());
+            } catch (IOException | RuntimeException e) {
+                deferred.add(plan.fileId());
+                err.println("Warning: the interrupted delete of file " + plan.fileId() + " could not be "
+                        + (plan.finish() ? "finished" : "undone") + " (" + step + ": " + e + "); its deletion marker"
+                        + " was kept, and the next start tries again"
+                        + (plan.finish() ? " (so does the next repair)." : "; the file itself is intact."));
+            }
+        }
+        return new Deletes(List.copyOf(undone), List.copyOf(finished), chunksDeleted, List.copyOf(deferred),
+                List.copyOf(waiting));
+    }
+
+    // ---------------------------------------------------------------------
     // Step 4: stale temp files
     // ---------------------------------------------------------------------
 
@@ -682,10 +810,14 @@ final class StartupRecovery {
             for (String name : manifests.listEntryNames()) {
                 Matcher manifest = MANIFEST_ENTRY.matcher(name);
                 Matcher pending = PENDING_ENTRY.matcher(name);
+                Matcher deleting = DELETING_ENTRY.matcher(name);
                 if (manifest.matches()) {
                     manifestIds.add(manifest.group(1));
                 } else if (pending.matches()) {
                     pendingIds.add(pending.group(1));
+                } else if (deleting.matches()) {
+                    // a delete that waits: its chunks are the next start's or repair's business, not orphans
+                    pendingIds.add(deleting.group(1));
                 }
             }
         } catch (IOException | RuntimeException e) {

@@ -28,6 +28,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * and {@code POST /cluster/repair} (no query, {@code ?dryRun=true} or {@code ?dryRun=false}; 409
  * {@code repair_in_progress} while a repair runs), and, with the web console ({@link ConsoleApi},
  * {@link ConsoleAssets}), {@code GET /} and its two asset paths, {@code GET /files},
+ * {@code DELETE /files/<fileId>} (see {@link FileService#delete}; 200, or 202 when copies wait for a node),
  * {@code GET /files/<fileId>/placement} and {@code GET /cluster/events}. Every other path is 404
  * {@code not_found}.
  *
@@ -273,14 +274,21 @@ class FileApiHandler implements HttpHandler {
             return;
         }
         if (path != null && path.startsWith(FILE_PATH_PREFIX)) {
-            if (!"GET".equals(exchange.getRequestMethod())) {
-                sendError(exchange, ApiError.METHOD_NOT_ALLOWED, "GET");
+            // DELETE is served by the full handler (the one with the cluster endpoints and the console).
+            boolean deletes = console != null;
+            String method = exchange.getRequestMethod();
+            if (!"GET".equals(method) && !(deletes && "DELETE".equals(method))) {
+                sendError(exchange, ApiError.METHOD_NOT_ALLOWED, deletes ? "GET, DELETE" : "GET");
                 return;
             }
             // Still the raw text: checked exactly as received, so %2e, %2F and the like are refused.
             String fileId = path.substring(FILE_PATH_PREFIX.length());
             if (!FileIds.isValid(fileId)) {
                 sendError(exchange, ApiError.INVALID_FILE_ID, null);
+                return;
+            }
+            if ("DELETE".equals(method)) {
+                handleDelete(exchange, fileId, target);
                 return;
             }
             handleDownload(exchange, fileId);
@@ -401,6 +409,32 @@ class FileApiHandler implements HttpHandler {
             return;
         }
         sendAsset(exchange, asset.get());
+    }
+
+    /**
+     * {@code DELETE /files/<fileId>} (see {@link FileService#delete}): 200 when every copy is gone,
+     * 202 when the delete committed but some copies wait for a node; no query.
+     */
+    private void handleDelete(HttpExchange exchange, String fileId, URI target) throws IOException {
+        if (target.getRawQuery() != null) {
+            sendError(exchange, ApiError.INVALID_QUERY, null);
+            return;
+        }
+        FileService.DeleteResult result;
+        try {
+            result = files.delete(fileId);
+        } catch (FileServiceException e) {
+            if (e.reason() != FileServiceException.Reason.FILE_NOT_FOUND) {
+                err.println("Error: the delete of file " + fileId + " failed: " + e
+                        + (e.getCause() != null ? " (cause: " + e.getCause() + ")" : ""));
+            }
+            sendError(exchange, errorFor(e.reason()), null);
+            return;
+        }
+        sendJson(exchange, result.finished() ? 200 : 202, "{\"fileId\":" + Json.quote(result.fileId())
+                + ",\"name\":" + (result.name() == null ? "null" : Json.quote(result.name()))
+                + ",\"chunksDeleted\":" + result.chunksDeleted()
+                + ",\"finished\":" + result.finished() + "}");
     }
 
     /** {@code GET /files/<fileId>/placement}: the raw ID is checked exactly, as for downloads. */
