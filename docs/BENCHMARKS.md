@@ -1,6 +1,6 @@
 # DistributedFS: benchmarks
 
-Written by `scripts\bench.ps1` on 2026-10-27 17:54 +05:30. These numbers describe one machine on one day; they are not run in CI and not a guarantee for other environments. See the [README](../README.md) for the overview.
+Written by `scripts\bench.ps1` on 2026-11-03 14:07 +05:30. These numbers describe one machine on one day; they are not run in CI and not a guarantee for other environments. See the [README](../README.md) for the overview.
 
 ## Setup
 
@@ -21,24 +21,24 @@ Written by `scripts\bench.ps1` on 2026-10-27 17:54 +05:30. These numbers describ
 | OS | Microsoft Windows 11 Home Single Language 10.0.26200 (build 26200) |
 | JDK | java version "23.0.1" 2024-10-15; Java(TM) SE Runtime Environment (build 23.0.1+11-39); Java HotSpot(TM) 64-Bit Server VM (build 23.0.1+11-39, mixed mode, sharing) |
 | PowerShell | 5.1.26100.9711 |
-| Source | `8535e73-dirty` |
+| Source | `e522419-dirty`: branch `release/v1.0.0`, whose code is `e522419` (PR #12 merged) with only documentation changes uncommitted |
 
 ## Medians of 3 runs
 
 | Measure | Median |
 |---|---|
-| Upload throughput | 26.2 MiB/s (2.44 s) |
-| Download throughput | 63.3 MiB/s (1.01 s) |
-| Kill to DOWN | 5.31 s |
+| Upload throughput | 28.0 MiB/s (2.28 s) |
+| Download throughput | 67.1 MiB/s (0.95 s) |
+| Kill to DOWN | 5.20 s |
 | Repair to 2 copies | 1.69 s (44 copies added) |
 
 ## Every run
 
 | Run | Upload | Download | Kill to DOWN | Repair | Copies added | Repair, server's `durationMillis` |
 |---|---|---|---|---|---|---|
-| 1 | 2.44 s, 26.2 MiB/s | 1.06 s, 60.4 MiB/s | 5.29 s | 1.64 s | 44 | 1613 ms |
-| 2 | 2.38 s, 26.9 MiB/s | 0.95 s, 67.2 MiB/s | 5.62 s | 1.69 s | 44 | 1673 ms |
-| 3 | 2.63 s, 24.3 MiB/s | 1.01 s, 63.3 MiB/s | 5.31 s | 1.88 s | 44 | 1871 ms |
+| 1 | 2.25 s, 28.4 MiB/s | 1.10 s, 58.2 MiB/s | 5.20 s | 1.69 s | 44 | 1667 ms |
+| 2 | 2.83 s, 22.6 MiB/s | 0.95 s, 67.1 MiB/s | 5.03 s | 1.98 s | 44 | 1957 ms |
+| 3 | 2.28 s, 28.0 MiB/s | 0.84 s, 76.5 MiB/s | 5.91 s | 1.66 s | 44 | 1634 ms |
 
 ## Caveats
 
