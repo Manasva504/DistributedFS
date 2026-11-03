@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/Manasva504/DistributedFS/actions/workflows/ci.yml/badge.svg)](https://github.com/Manasva504/DistributedFS/actions/workflows/ci.yml)
 
+**Version:** v1.0.0 (November 2026) · [Release notes](docs/RELEASE_NOTES_v1.0.0.md)
+
 A small distributed file store in plain Java, with no dependencies: files are split into SHA-256-checked chunks, every chunk is stored twice across 3 storage node processes, failed nodes are detected by heartbeats, missing copies are restored by an on-demand repair, and a small web console shows it all.
 
 > **This is a learning project, not production software.** The server has no authentication, no TLS (plain HTTP on `127.0.0.1` only) and no storage quotas, and it has been tested only on Windows (one laptop and GitHub Actions' Windows runners). See [Known limitations](#limitations-and-future-work).
@@ -179,9 +181,9 @@ Medians of 3 runs of `scripts\bench.ps1` on one laptop (Intel Core i5-13450HX, 1
 
 | Measure | Median |
 |---|---|
-| Upload of a 64 MiB file | 26.2 MiB/s (2.44 s) |
-| Download of that file (every chunk and the whole file checked first) | 63.3 MiB/s (1.01 s) |
-| Node killed until `GET /cluster/status` shows it DOWN | 5.31 s |
+| Upload of a 64 MiB file | 28.0 MiB/s (2.28 s) |
+| Download of that file (every chunk and the whole file checked first) | 67.1 MiB/s (0.95 s) |
+| Node killed until `GET /cluster/status` shows it DOWN | 5.20 s |
 | `POST /cluster/repair` until every chunk has 2 copies again (44 copies) | 1.69 s |
 
 These are loopback numbers from one machine, not network numbers; the method, every run and the caveats are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). The benchmark is not run in CI.
@@ -195,12 +197,13 @@ In short:
 - **Check-then-act gaps in storage operations.** The no-follow checks on a node's folder and chunk files happen before the read, write or delete, not atomically with it, so a link swapped in between is not detected. The folders above a node's folder are not checked.
 - **Repair is manual.** Each chunk has two copies, so one node can be down, or one copy damaged or lost, without losing data. A lost or damaged copy is made again only when someone calls `POST /cluster/repair`; until then the chunk stays under-replicated, and losing its other copy loses it. Nothing checks copies in the background.
 - **A degraded start needs 2 nodes and leaves some work for later.** The server starts with recorded nodes down if at least 2 answer, but interrupted uploads that a missing node may be part of keep their markers, and a rollback that a down node cannot confirm keeps its marker, until a start with those nodes.
+- **A delete with a node down keeps every copy for a while.** The file is gone at once, but a chunk's copies are deleted only when every node answers; the next repair with every node UP, or the next start, removes them. Deletes cannot be undone.
 - **Requests without an `Origin` header are trusted.** The cross-site check stops pages in a browser; a program on this machine sends no `Origin` and is accepted as before, since there is no authentication.
 - **The console counts copies by name.** Its health badges and chunk map count chunk files on the nodes without reading them, so a damaged copy looks good until a download or a repair finds it; a DOWN node's copies are shown from its last listing.
 
 Every limitation, in detail, is in [docs/DESIGN.md](docs/DESIGN.md#known-limitations).
 
-Networked storage nodes, replication, and failure detection and repair are done (see [Project history](#project-history)). Follow-up work (not scheduled):
+Networked storage nodes, replication, failure detection and repair, the web console, file names and deletes are done (see [Project history](#project-history)). Follow-up work (not scheduled):
 
 - Stop a client that stalls partway through its request headers from holding a worker thread (this step runs inside the JDK's HTTP server, before the handler).
 - Use the chunk checksums in startup recovery, and run the repair's checks in the background ("scrubbing"), so damaged copies are found before anyone downloads them or asks for a repair.
@@ -237,18 +240,19 @@ Every request, field and error code is described in [docs/DESIGN.md](docs/DESIGN
 | 5 | `StorageCluster`: placement and lookup across nodes | `76c028a`* |
 | 6 | `DistributedFsDemo`: end-to-end command-line demo | `59529d8` |
 | 7 | Documentation: this README | `9b03340` |
-| 8 | HTTP API: `GET /health`, `POST /files` uploads with rollback, persistent manifests and startup recovery (`53605c4`); verified `GET /files/<fileId>` downloads (`0feb7a1`) | `53605c4`, `0feb7a1` |
-| — | Hardening: stalled request bodies and uploads no longer hold worker threads; chunk retrieval refuses links and junctions | `64ac867` |
+| 8 | HTTP API: `GET /health`, `POST /files` uploads with rollback, persistent manifests and startup recovery (`53605c4`); verified `GET /files/<fileId>` downloads (`0feb7a1`) | `53605c4`, `0feb7a1`, merged in PR #1 (`2f157a1`) |
+| — | Hardening: stalled request bodies and uploads no longer hold worker threads; chunk retrieval refuses links and junctions | `64ac867`, merged in PR #2 (`66eb219`) |
 | 9 | Verification and integrity: GitHub Actions CI (`scripts\test.ps1`); per-chunk SHA-256 in manifests (format 2), checked on every download; storing refuses a junctioned node folder | `0eec1d1`, merged in PR #3 (`5c26b34`) |
 | M1a | Networked storage nodes, first half: the `ChunkStore` interface, the storage node process (`StorageNodeServer`) and its client (`RemoteStorageNode`), with tests | `6b98712`, merged in PR #5 (`d399531`) |
 | M1b | Networked storage nodes, second half: the server uses node processes (`--node`, `nodes.txt`), startup recovery through the node API, a lost store answer rolled back as "maybe stored", `scripts\demo.ps1` | `7adce90`, merged in PR #6 (`b6afdef`) |
 | M2 | Replication factor 2: two copies of every chunk on different nodes, uploads and downloads with a node down, verified reads that skip damaged copies, recovery and reports for copies, `scripts\kill-demo.ps1` | `528a756`, merged in PR #7 (`3337474`) |
 | M3 | Failure detection and repair: heartbeat and `GET /cluster/status`, manual `POST /cluster/repair` (with dry run), more than 2 copies allowed, degraded start with a node down, `scripts\repair-demo.ps1` | `848e8e5`, merged in PR #8 (`8535e73`) |
-| M4a | This README rewritten for a short read, with the detail moved to `docs/DESIGN.md` and `docs/TESTING.md`; `scripts\bench.ps1` and `docs/BENCHMARKS.md` | `84feadb`, merged in PR #9 (`70bfb59`) |
+| M4a | This README rewritten for a short read, with the detail moved to `docs/DESIGN.md` and `docs/TESTING.md`; `scripts\bench.ps1` and `docs/BENCHMARKS.md` | `84feadb`, `46baf49`, merged in PR #9 (`70bfb59`) |
 | M4b-1 | Cross-site requests refused on the server (`Origin`, `Sec-Fetch-Site`) and on the storage nodes | `f25b593`, merged in PR #10 (`3b6c1d0`) |
 | M4b-2 | Web console at `GET /`, with `GET /files`, `GET /files/<fileId>/placement` and `GET /cluster/events`; `scripts\console-demo.ps1` and `scripts\console-smoke.ps1` | `2cdfe0e`, merged in PR #11 (`cf9d828`) |
-| — | Deletes: `DELETE /files/<fileId>` with a deletion marker and the manifest's removal as the commit point, finished by startup recovery and the repair; the console's delete button | PR #12 |
+| M4c | Deletes: `DELETE /files/<fileId>` with a deletion marker and the manifest's removal as the commit point, finished by startup recovery and the repair; the console's delete button | `f5c9ed9`, merged in PR #12 (`e522419`) |
+| v1.0.0 | First release: the documentation brought up to date and the [release notes](docs/RELEASE_NOTES_v1.0.0.md) | this PR |
 
-\* Phases 1–5 were built before the Git repository was created, so they are all in the initial commit.
+\* Phases 1–5 were built before the Git repository was created, so they are all in the initial commit. Phases 6 and 7 were committed straight to `main`, before pull requests were used.
 
 The repository layout is in [docs/DESIGN.md](docs/DESIGN.md#repository-structure). Personal learning project; issues and suggestions welcome. Before suggesting a change, run all 48 suites (781 normal tests) and, separately, the 10 stress tests, as described in [docs/TESTING.md](docs/TESTING.md#run-the-tests).
